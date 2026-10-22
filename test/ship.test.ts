@@ -28,6 +28,7 @@ function shipConfig(overrides: Partial<ShipConfig> = {}): ShipConfig {
     marketplaceDir: "/tmp/marketplace",
     backendPort: 8010,
     recoveryMs: 25_000,
+    labelFallback: false,
     ...overrides,
   };
 }
@@ -68,11 +69,11 @@ test("a ship pull deploys once until its head changes, and failures retry", asyn
   const deployed: number[] = [];
   let fail = true;
   const watcher = new ShipWatcher({
-    config: shipConfig(),
+    config: shipConfig({ labelFallback: true }),
     stateFile: file,
     listPulls: async () => [pull],
     deploy: async (item) => {
-      deployed.push(item.number);
+      deployed.push(item.pr);
       if (fail) throw new Error("health timeout");
       return { sha: item.sha };
     },
@@ -92,7 +93,7 @@ test("a ship pull deploys once until its head changes, and failures retry", asyn
   assert.equal(watcher.status().backendPort, 8010);
 
   const again = new ShipWatcher({
-    config: shipConfig(),
+    config: shipConfig({ labelFallback: true }),
     stateFile: file,
     listPulls: async () => [pull],
     deploy: async () => {
@@ -105,7 +106,7 @@ test("a ship pull deploys once until its head changes, and failures retry", asyn
   const moved = { ...pull, sha: "bbbbbbb123456789" };
   let movedDeploys = 0;
   const third = new ShipWatcher({
-    config: shipConfig(),
+    config: shipConfig({ labelFallback: true }),
     stateFile: file,
     listPulls: async () => [moved],
     deploy: async () => {
@@ -325,12 +326,12 @@ test("deploys and manual recovery are on the HTTP API", async () => {
     assert.equal(tooSoon.status, 409);
 
     const watcher = new ShipWatcher({
-      config: shipConfig({ recoveryMs: 1_000 }),
+      config: shipConfig({ recoveryMs: 1_000, labelFallback: true }),
       stateFile: false,
       listPulls: async () => [pull],
       deploy: async () => ({ sha: pull.sha }),
-      onDeployed: (pr) => {
-        started.app.beginRecovery({ env: "prod", pr, durationMs: 1_000 });
+      onDeployed: ({ pr, incidentId }) => {
+        started.app.beginRecovery({ env: "prod", pr, incidentId, durationMs: 1_000 });
       },
     });
     started.app.setRecoveryListener((notice) => watcher.noteRecovery(notice));
@@ -396,6 +397,173 @@ test("deploys and manual recovery are on the HTTP API", async () => {
     assert.equal(/root cause|\bdemo\b/i.test(css), false);
   } finally {
     await started.close();
+    await bot.close();
+  }
+});
+
+test("label polling stays off unless the fallback is enabled", async () => {
+  let calls = 0;
+  const watcher = new ShipWatcher({
+    config: shipConfig(),
+    stateFile: false,
+    listPulls: async () => {
+      calls += 1;
+      return [pull];
+    },
+  });
+  watcher.start();
+  await watcher.poll();
+  watcher.stop();
+  assert.equal(calls, 0);
+  assert.equal(watcher.status().labelFallback, false);
+});
+
+test("ship hook is authorized, idempotent per incident, and cleared on resolve", async () => {
+  const started = await startTestServer({
+    config: { observabilitySharedSecret: "shared-secret", botAlias: "" },
+  });
+  try {
+    const hook = {
+      incidentId: "inc_bot_1",
+      prNumber: 19,
+      branch: "checkout-totals",
+      headSha: "abc1234def",
+    };
+    let deploys = 0;
+    const watcher = new ShipWatcher({
+      config: shipConfig(),
+      stateFile: false,
+      deploy: async (target) => {
+        deploys += 1;
+        assert.equal(target.pr, 19);
+        assert.equal(target.branch, "checkout-totals");
+        assert.equal(target.source, "hook");
+        if (deploys === 1) assert.equal(target.sha, "abc1234def");
+        return { sha: target.sha || "abc1234def" };
+      },
+      onDeployed: ({ pr, incidentId }) => {
+        started.app.beginRecovery({ env: "prod", pr, incidentId, durationMs: 25_000 });
+      },
+    });
+    started.app.setShipAccept((body) => watcher.accept(body));
+    started.app.setAfterResolve(() => watcher.clearHandled());
+    started.app.setDeployStatus(() => watcher.status());
+
+    const denied = await fetch(`${started.url}/api/ship-hook`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-observability-token": "nope" },
+      body: JSON.stringify(hook),
+    });
+    assert.equal(denied.status, 401);
+    assert.equal(deploys, 0);
+
+    const accepted = await fetch(`${started.url}/api/ship-hook`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-observability-token": "shared-secret" },
+      body: JSON.stringify(hook),
+    });
+    assert.equal(accepted.status, 200);
+    const first = (await accepted.json()) as { duplicate: boolean; deploy: { incidentId?: string; status: string } };
+    assert.equal(first.duplicate, false);
+    assert.equal(first.deploy.status, "healthy");
+    assert.equal(first.deploy.incidentId, "inc_bot_1");
+    assert.equal(deploys, 1);
+    assert.deepEqual(watcher.status().handled, ["incident:inc_bot_1"]);
+
+    const again = await fetch(`${started.url}/api/ship-hook`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-observability-token": "shared-secret" },
+      body: JSON.stringify(hook),
+    });
+    const second = (await again.json()) as { duplicate: boolean };
+    assert.equal(second.duplicate, true);
+    assert.equal(deploys, 1);
+
+    const resolved = await fetch(`${started.url}/api/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ env: "prod" }),
+    });
+    assert.equal(resolved.status, 200);
+    assert.deepEqual(watcher.status().handled, []);
+
+    const retried = await fetch(`${started.url}/api/ship-hook`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-observability-token": "shared-secret" },
+      body: JSON.stringify({ ...hook, headSha: "" }),
+    });
+    assert.equal(retried.status, 200);
+    assert.equal(deploys, 2);
+  } finally {
+    await started.close();
+  }
+});
+
+test("recovery uses the ship hook incident id", async () => {
+  const bot = await startMockBot();
+  let now = Date.UTC(2026, 0, 3, 12, 0, 0);
+  const app = new DatacatApp({
+    now: () => now,
+    config: {
+      historyHours: 0,
+      generatorIntervalMs: 5_000,
+      botAlias: bot.url,
+      observabilitySharedSecret: "shared-secret",
+      metricsPushEnabled: false,
+    },
+  });
+  try {
+    const opened = app.triggerAnomaly("prod");
+    await app.flushAlerts();
+    now += 1_000;
+    const recovery = app.beginRecovery({
+      env: "prod",
+      pr: 19,
+      incidentId: "inc_from_bot",
+      durationMs: 25_000,
+    });
+    app.tick(recovery.from + 20_000);
+    await app.whenIdle();
+    const posted = bot.requests.find((request) => JSON.parse(request.body).status === "recovered");
+    assert.ok(posted);
+    const payload = JSON.parse(posted.body) as { incidentId: string; env: string };
+    assert.equal(payload.incidentId, "inc_from_bot");
+    assert.notEqual(payload.incidentId, opened.incident.id);
+    assert.equal(payload.env, "prod");
+    assert.equal(posted.headers["x-observability-token"], "shared-secret");
+    assert.equal(posted.headers["x-bdk-session-key"], "incident:inc_from_bot");
+  } finally {
+    await bot.close();
+  }
+});
+
+test("reset bot posts to the reset route and treats 202 as success", async () => {
+  const bot = await startMockBot();
+  bot.setStatus(202);
+  const app = new DatacatApp({
+    config: {
+      botAlias: bot.url,
+      agentAliasToken: "alias-token",
+      observabilitySharedSecret: "shared-secret",
+      webhookSecret: "topsecret",
+      hmacHeader: "X-Datacat-Signature",
+      metricsPushEnabled: false,
+    },
+  });
+  try {
+    const result = await app.resetBot();
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 202);
+    const posted = bot.requests[0];
+    assert.ok(posted);
+    assert.equal(posted.method, "POST");
+    assert.equal(posted.url, "/v1/channels/observability/reset");
+    assert.equal(posted.body, "{}");
+    assert.equal(posted.headers["x-agent-alias-token"], "alias-token");
+    assert.equal(posted.headers["x-observability-token"], "shared-secret");
+    assert.equal(posted.headers["x-datacat-signature"], signBody("topsecret", "{}"));
+    assert.equal(posted.headers["x-bdk-session-key"], undefined);
+  } finally {
     await bot.close();
   }
 });

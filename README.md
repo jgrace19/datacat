@@ -135,7 +135,9 @@ The JSON body is `{ sentAt, snapshots, openIncidents }`. Each snapshot has `env`
 | `GET` | `/api/dashboard?env&range` | `range` is `15m`, `1h`, `4h`, or `1d`. |
 | `POST` | `/api/settings` | `{ "botAlias", "pushEnabled", "pushIntervalMs" }`. The alias token, observability secret, and HMAC secret stay in the environment. |
 | `POST` | `/api/push-now` | Send one snapshot. |
-| `GET` | `/api/deploys` | Ship watcher status: last poll, handled heads, and each deploy. |
+| `GET` | `/api/deploys` | Ship status: handled incident ids, label fallback, and each deploy. |
+| `POST` | `/api/ship-hook` | `{ "incidentId", "prNumber", "branch", "headSha" }`. Requires `X-Observability-Token`. Deploys that pull request and starts recovery. Idempotent per `incidentId`. |
+| `POST` | `/api/reset-bot` | POST the bot reset route and return its JSON. A 202 is success. |
 | `POST` | `/api/push-recovery` | `{ "env": "prod" }`. Send one recovery event once GMV and AOV are within 10% of baseline. |
 | `POST` | `/api/incidents/:id/redeliver` | Retry a delivery that has not succeeded. |
 
@@ -162,11 +164,11 @@ Each sample runs `scripts/demo-checkout-metrics.py --api <backend>` (the fixed 4
 
 `--once` sends a single sample and exits. Otherwise it loops until SIGINT and stops both processes on the way out.
 
-## Ship watcher
+## Ship hook
 
-`npm run dev` and `npm start` poll GitHub every 5 seconds (`SHIP_WATCH_INTERVAL_MS`) with the local `gh` CLI. `npm run ship-watcher` starts the same server with the watcher forced on. The watch is `gh pr list` for open pull requests on `SHIP_REPO` (default `jgrace19/marketplace`) whose base is `SHIP_BASE` (default `demo/base`) and whose label is `SHIP_LABEL` (default `ship`).
+The bot pushes a ship here. `POST /api/ship-hook` requires `X-Observability-Token` equal to `OBSERVABILITY_SHARED_SECRET` and returns 401 otherwise. The body is `{ "incidentId", "prNumber", "branch", "headSha" }`. The same `incidentId` does not deploy twice until `POST /api/resolve` clears the handled list.
 
-Each new head is deployed with the pull request left open. In `MARKETPLACE_DIR` (default `~/cursor-dev/marketplace`) it runs `git fetch origin pull/<n>/head` and `git checkout --detach FETCH_HEAD`. It then restarts only the API, from `backend/`:
+In `MARKETPLACE_DIR` (default `~/cursor-dev/marketplace`) datacat runs `git fetch origin pull/<prNumber>/head`, or `git fetch origin <branch>` when `branch` is set. It detaches at `headSha` when that field is non-empty, and at `FETCH_HEAD` otherwise. It then restarts only the API, from `backend/`:
 
 ```bash
 env -u STRIPE_SECRET_KEY nohup .venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8010 > /tmp/mp-backend.log 2>&1 &
@@ -174,10 +176,21 @@ env -u STRIPE_SECRET_KEY nohup .venv/bin/python -m uvicorn main:app --host 127.0
 
 The port is `MARKETPLACE_BACKEND_PORT` (default `8010`). Port `8000` is refused, so a preview runner is left alone. The Vite process is not restarted. The watcher waits until `http://127.0.0.1:<port>/api/health` returns 200.
 
-On success it closes the `prod` incident the way **Resolve** does, draws a chart marker `Deploy: PR #<n>`, and lets GMV and average order value climb back over about 25 seconds. Orders and units stay flat. Once those readings are within 10% of baseline, or when the climb settles, datacat POSTs the recovery event described above. Handled `<pr>:<sha>` keys are stored in the temp file `datacat-ship-handled.json`, so a restart does not deploy the same head again. A failed deploy is retried on the next poll. `GET /api/deploys` returns the watcher status. Set `SHIP_WATCH_ENABLED=false` to keep polling off.
+On success it closes the `prod` incident the way **Resolve** does, draws a chart marker `Deploy: PR #<n>`, and lets GMV and average order value climb back over about 25 seconds. Orders and units stay flat. Once those readings are within 10% of baseline, or when the climb settles, datacat POSTs the recovery event described above. The recovery `incidentId` is the one from the ship hook. A failed deploy is not remembered, so the hook can be retried. `GET /api/deploys` returns the status.
+
+`SHIP_LABEL_FALLBACK=true` also polls `gh pr list` every `SHIP_WATCH_INTERVAL_MS` for open pull requests on `SHIP_REPO` with base `SHIP_BASE` and label `SHIP_LABEL`. That path is off by default.
+
+`npm run tunnel` runs `cloudflared tunnel --url http://127.0.0.1:8787` and, if that does not publish a URL, `npx localtunnel --port 8787`. It prints the public https URL and writes it to `.tunnel-url`.
+
+`npm run reset-bot` POSTs `{}` to `$BOT_ALIAS/v1/channels/observability/reset` with `X-Observability-Token`, `X-Agent-Alias-Token` when it is set, and the alert HMAC header when a webhook secret is set. It prints the JSON body. HTTP 202 is success.
 
 ```bash
 curl -s http://127.0.0.1:8787/api/deploys
+curl -s -X POST http://127.0.0.1:8787/api/ship-hook \
+  -H 'content-type: application/json' \
+  -H "x-observability-token: $OBSERVABILITY_SHARED_SECRET" \
+  -d '{"incidentId":"inc_from_bot","prNumber":128,"branch":"","headSha":""}'
+curl -s -X POST http://127.0.0.1:8787/api/reset-bot
 curl -s -X POST http://127.0.0.1:8787/api/push-recovery -H 'content-type: application/json' -d '{"env":"prod"}'
 ```
 

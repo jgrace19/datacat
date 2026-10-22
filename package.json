@@ -11,7 +11,9 @@
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "ship-watcher": "tsx src/ship-watcher.ts",
-    "test": "tsx --test test/config.test.ts test/store.test.ts test/metrics.test.ts test/app.test.ts test/api.test.ts test/preview-runner.test.ts test/deploy.test.ts test/ship.test.ts",
+    "reset-bot": "tsx src/reset-bot.ts",
+    "tunnel": "tsx scripts/tunnel.ts",
+    "test": "tsx --test test/config.test.ts test/store.test.ts test/metrics.test.ts test/app.test.ts test/api.test.ts test/preview-runner.test.ts test/deploy.test.ts test/ship.test.ts test/tunnel.test.ts",
     "typecheck": "tsc --noEmit",
     "preview": "tsx scripts/preview-runner.ts"
   },

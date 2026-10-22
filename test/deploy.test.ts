@@ -35,6 +35,18 @@ test("checkout fetches the pull request head and detaches", async () => {
     "git checkout --detach FETCH_HEAD /work/marketplace",
     "git rev-parse HEAD /work/marketplace",
   ]);
+
+  calls.length = 0;
+  await checkoutPullRequest("/work/marketplace", 19, run, { branch: "checkout-totals", headSha: "abc1234def" });
+  assert.deepEqual(calls, [
+    "git fetch origin checkout-totals /work/marketplace",
+    "git checkout --detach abc1234def /work/marketplace",
+    "git rev-parse HEAD /work/marketplace",
+  ]);
+  await assert.rejects(
+    () => checkoutPullRequest("/work/marketplace", 19, run, { headSha: "not-a-sha" }),
+    /headSha/,
+  );
 });
 
 test("stopping listeners only signals the requested port", async () => {

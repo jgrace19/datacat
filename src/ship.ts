@@ -23,6 +23,8 @@ export type DeployRecord = {
   sha: string;
   title: string;
   url: string;
+  source: "hook" | "label";
+  incidentId?: string;
   status: "deploying" | "healthy" | "failed";
   startedAt: number;
   finishedAt?: number;
@@ -39,6 +41,7 @@ export type DeployStatus = {
   repo: string;
   base: string;
   label: string;
+  labelFallback: boolean;
   marketplaceDir: string;
   backendPort: number;
   lastPollAt: number | null;
@@ -113,11 +116,33 @@ function saveHandled(file: string, handled: Set<string>): void {
   writeFileSync(file, JSON.stringify([...handled]), "utf8");
 }
 
+export type ShipTarget = {
+  pr: number;
+  sha: string;
+  branch: string;
+  incidentId?: string;
+  title: string;
+  url: string;
+  source: "hook" | "label";
+};
+
+export type ShipHookBody = {
+  incidentId: string;
+  prNumber: number;
+  branch: string;
+  headSha: string;
+};
+
+export type ShipAcceptResult = {
+  duplicate: boolean;
+  deploy: DeployRecord;
+};
+
 export type ShipWatcherOptions = {
   config: ShipConfig;
   listPulls?: () => Promise<ShipPull[]>;
-  deploy?: (pull: ShipPull, config: ShipConfig) => Promise<{ sha: string }>;
-  onDeployed?: (pr: number) => void;
+  deploy?: (target: ShipTarget, config: ShipConfig) => Promise<{ sha: string }>;
+  onDeployed?: (event: { pr: number; incidentId?: string }) => void;
   now?: () => number;
   /** `false` keeps the handled set in memory. Omit to use the temp file. */
   stateFile?: string | false;
@@ -126,12 +151,13 @@ export type ShipWatcherOptions = {
 export class ShipWatcher {
   private readonly config: ShipConfig;
   private readonly listPulls: () => Promise<ShipPull[]>;
-  private readonly deploy: (pull: ShipPull, config: ShipConfig) => Promise<{ sha: string }>;
-  private readonly onDeployed: ((pr: number) => void) | undefined;
+  private readonly deploy: (target: ShipTarget, config: ShipConfig) => Promise<{ sha: string }>;
+  private readonly onDeployed: ((event: { pr: number; incidentId?: string }) => void) | undefined;
   private readonly now: () => number;
   private readonly stateFile: string | undefined;
   private readonly handled: Set<string>;
   private readonly deploys: DeployRecord[] = [];
+  private readonly inflightHooks = new Map<string, Promise<DeployRecord>>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private inflight = false;
   private lastPollAt: number | null = null;
@@ -151,9 +177,11 @@ export class ShipWatcher {
     this.deploy =
       options.deploy ??
       (async (pull, config) =>
-        deployPullRequest(pull.number, {
+        deployPullRequest(pull.pr, {
           marketplaceDir: config.marketplaceDir,
           port: config.backendPort,
+          branch: pull.branch,
+          headSha: pull.sha,
         }));
     this.stateFile =
       options.stateFile === undefined ? HANDLED_FILE : options.stateFile === false ? undefined : options.stateFile;
@@ -161,9 +189,9 @@ export class ShipWatcher {
   }
 
   start(): void {
-    if (this.timer || !this.config.enabled) return;
+    if (this.timer || !this.config.enabled || !this.config.labelFallback) return;
     console.log(
-      `[datacat] ship watcher polling ${this.config.repo} base ${this.config.base} label ${this.config.label} every ${this.config.intervalMs}ms`,
+      `[datacat] ship label fallback polling ${this.config.repo} base ${this.config.base} label ${this.config.label} every ${this.config.intervalMs}ms`,
     );
     void this.poll();
     this.timer = setInterval(() => {
@@ -178,7 +206,7 @@ export class ShipWatcher {
   }
 
   async poll(): Promise<void> {
-    if (!this.config.enabled || this.inflight) return;
+    if (!this.config.enabled || !this.config.labelFallback || this.inflight) return;
     this.inflight = true;
     try {
       let pulls: ShipPull[];
@@ -218,6 +246,7 @@ export class ShipWatcher {
       repo: this.config.repo,
       base: this.config.base,
       label: this.config.label,
+      labelFallback: this.config.labelFallback,
       marketplaceDir: this.config.marketplaceDir,
       backendPort: this.config.backendPort,
       lastPollAt: this.lastPollAt,
@@ -227,12 +256,95 @@ export class ShipWatcher {
     };
   }
 
+  clearHandled(): void {
+    this.handled.clear();
+    if (this.stateFile) saveHandled(this.stateFile, this.handled);
+  }
+
+  /** Deploy a pushed ship hook. A repeated incidentId does not deploy again. */
+  async accept(hook: ShipHookBody): Promise<ShipAcceptResult> {
+    const incidentId = hook.incidentId.trim();
+    if (!incidentId) throw new Error("incidentId is required");
+    if (!Number.isInteger(hook.prNumber) || hook.prNumber < 1) throw new Error("prNumber must be a positive integer");
+    const key = `incident:${incidentId}`;
+    if (this.handled.has(key)) {
+      return { duplicate: true, deploy: this.recordFor(incidentId, hook.prNumber) };
+    }
+    const pending = this.inflightHooks.get(key);
+    if (pending) {
+      return { duplicate: true, deploy: await pending };
+    }
+    const work = this.deployHook(hook, key);
+    this.inflightHooks.set(key, work);
+    try {
+      const deploy = await work;
+      return { duplicate: false, deploy };
+    } finally {
+      this.inflightHooks.delete(key);
+    }
+  }
+
+  private recordFor(incidentId: string, pr: number): DeployRecord {
+    const found = this.deploys.find((item) => item.incidentId === incidentId);
+    if (found) return { ...found, recovery: found.recovery ? { ...found.recovery } : undefined };
+    return {
+      pr,
+      sha: "",
+      title: "",
+      url: "",
+      source: "hook",
+      incidentId,
+      status: "healthy",
+      startedAt: this.now(),
+      healthUrl: `http://127.0.0.1:${this.config.backendPort}/api/health`,
+      dir: this.config.marketplaceDir,
+      backendPort: this.config.backendPort,
+    };
+  }
+
+  private async deployHook(hook: ShipHookBody, key: string): Promise<DeployRecord> {
+    const target: ShipTarget = {
+      pr: hook.prNumber,
+      sha: hook.headSha.trim(),
+      branch: hook.branch.trim(),
+      incidentId: hook.incidentId.trim(),
+      title: hook.branch.trim(),
+      url: "",
+      source: "hook",
+    };
+    const record = await this.deployTarget(target);
+    if (record.status === "healthy") {
+      this.remember(key);
+      console.log(`[datacat] ship hook ${target.incidentId} PR #${target.pr} healthy (${record.sha.slice(0, 12)})`);
+      this.onDeployed?.({ pr: target.pr, incidentId: target.incidentId });
+    }
+    return record;
+  }
+
   private async deployOne(pull: ShipPull): Promise<void> {
-    const record: DeployRecord = {
+    const record = await this.deployTarget({
       pr: pull.number,
       sha: pull.sha,
+      branch: "",
       title: pull.title,
       url: pull.url,
+      source: "label",
+    });
+    if (record.status !== "healthy") return;
+    this.remember(`${pull.number}:${pull.sha}`);
+    if (record.sha !== pull.sha) this.remember(`${pull.number}:${record.sha}`);
+    console.log(`[datacat] ship PR #${pull.number} healthy (${record.sha.slice(0, 12)})`);
+    this.onDeployed?.({ pr: pull.number });
+  }
+
+  private async deployTarget(target: ShipTarget): Promise<DeployRecord> {
+    const record: DeployRecord = {
+      pr: target.pr,
+      sha: target.sha,
+      title: target.title,
+      url: target.url,
+      source: target.source,
+      incidentId: target.incidentId,
       status: "deploying",
       startedAt: this.now(),
       healthUrl: `http://127.0.0.1:${this.config.backendPort}/api/health`,
@@ -241,24 +353,21 @@ export class ShipWatcher {
     };
     this.deploys.unshift(record);
     if (this.deploys.length > 50) this.deploys.pop();
-    console.log(`[datacat] ship PR #${pull.number} ${pull.sha.slice(0, 12)} deploying`);
+    const label = target.incidentId ? `${target.incidentId} PR #${target.pr}` : `PR #${target.pr}`;
+    console.log(`[datacat] ship ${label} ${(target.sha || "head").slice(0, 12)} deploying`);
     try {
-      const result = await this.deploy(pull, this.config);
-      const sha = result.sha || pull.sha;
-      record.sha = sha;
+      const result = await this.deploy(target, this.config);
+      record.sha = result.sha || target.sha;
       record.status = "healthy";
       record.finishedAt = this.now();
       record.recovery = { status: "pending" };
-      this.remember(`${pull.number}:${pull.sha}`);
-      if (sha !== pull.sha) this.remember(`${pull.number}:${sha}`);
-      console.log(`[datacat] ship PR #${pull.number} healthy (${sha.slice(0, 12)})`);
-      this.onDeployed?.(pull.number);
     } catch (error) {
       record.status = "failed";
       record.finishedAt = this.now();
       record.error = error instanceof Error ? error.message : String(error);
-      console.error(`[datacat] ship PR #${pull.number} failed: ${record.error}`);
+      console.error(`[datacat] ship ${label} failed: ${record.error}`);
     }
+    return record;
   }
 
   private remember(key: string): void {

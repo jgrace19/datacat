@@ -1,10 +1,11 @@
+import { timingSafeEqual } from "node:crypto";
 import { createReadStream } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatacatApp, HttpError, isRangeKey, type RangeKey } from "./app.ts";
 import { configFromEnv, loadEnvFile, shipConfigFromEnv } from "./config.ts";
-import { ShipWatcher } from "./ship.ts";
+import { ShipWatcher, type ShipHookBody } from "./ship.ts";
 import { EXPECTED_LABEL, PRIMARY_METRIC, EnvNameError } from "./metrics.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -77,6 +78,33 @@ function asString(value: unknown, fallback = ""): string {
 
 function asNumber(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
+}
+
+function headerValue(req: http.IncomingMessage, name: string): string {
+  const value = req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0] ?? "";
+  return value ?? "";
+}
+
+function tokenMatches(expected: string, provided: string): boolean {
+  const actual = Buffer.from(provided);
+  const want = Buffer.from(expected);
+  if (want.length === 0 || actual.length !== want.length) return false;
+  return timingSafeEqual(actual, want);
+}
+
+function shipHookBody(value: Record<string, unknown>): ShipHookBody {
+  const incidentId = asString(value.incidentId).trim();
+  const branch = asString(value.branch).trim();
+  const headSha = asString(value.headSha).trim();
+  if (!incidentId) throw new HttpError(400, "incidentId is required");
+  if (typeof value.prNumber !== "number" || !Number.isInteger(value.prNumber) || value.prNumber < 1) {
+    throw new HttpError(400, "prNumber must be a positive integer");
+  }
+  if (value.branch !== undefined && typeof value.branch !== "string") throw new HttpError(400, "branch must be a string");
+  if (value.headSha !== undefined && typeof value.headSha !== "string") throw new HttpError(400, "headSha must be a string");
+  if (headSha && !/^[0-9a-f]{7,64}$/i.test(headSha)) throw new HttpError(400, "headSha must be a hex git id");
+  return { incidentId, prNumber: value.prNumber, branch, headSha };
 }
 
 function parseTime(value: string | null, now: number): number {
@@ -178,7 +206,26 @@ export function createServer(app: DatacatApp): http.Server {
         const env = body.env === undefined ? undefined : asString(body.env);
         const incidentId = body.incidentId === undefined ? undefined : asString(body.incidentId);
         const resolved = app.resolve({ env: env || undefined, incidentId: incidentId || undefined });
+        app.afterResolve();
         sendJson(res, 200, { resolved });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/ship-hook") {
+        const provided = headerValue(req, "x-observability-token");
+        if (!tokenMatches(app.config.observabilitySharedSecret, provided)) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
+        const hook = shipHookBody(asRecord(await readJson(req)));
+        const result = await app.shipAccept(hook);
+        sendJson(res, 200, { accepted: true, ...result });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/reset-bot") {
+        const result = await app.resetBot();
+        sendJson(res, result.ok ? result.status : 502, result.body);
         return;
       }
 
@@ -279,16 +326,18 @@ export async function main(): Promise<void> {
   const ship = shipConfigFromEnv();
   const watcher = new ShipWatcher({
     config: ship,
-    onDeployed: (pr) => {
-      app.beginRecovery({ env: "prod", pr, durationMs: ship.recoveryMs });
+    onDeployed: ({ pr, incidentId }) => {
+      app.beginRecovery({ env: "prod", pr, durationMs: ship.recoveryMs, incidentId });
     },
   });
   app.setRecoveryListener((notice) => watcher.noteRecovery(notice));
   app.setDeployStatus(() => watcher.status());
+  app.setShipAccept((hook) => watcher.accept(hook));
+  app.setAfterResolve(() => watcher.clearHandled());
   if (config.historyHours > 0) app.backfill("prod", config.historyHours);
   app.startLoops();
-  if (ship.enabled) watcher.start();
-  else console.log("[datacat] ship watcher off");
+  if (ship.enabled && ship.labelFallback) watcher.start();
+  else console.log("[datacat] ship hook ready, label polling off");
   const server = createServer(app);
   const port = await listen(server, config.port, config.host);
   const origin = `http://${config.host === "0.0.0.0" ? "127.0.0.1" : config.host}:${port}`;

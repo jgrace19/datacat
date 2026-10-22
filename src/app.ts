@@ -24,8 +24,9 @@ import {
   type ModeFlags,
 } from "./metrics.ts";
 import { SeriesStore, downsample, type Point } from "./store.ts";
+import { postBotReset, type BotResetResult } from "./bot-channel.ts";
 import { signBody } from "./sign.ts";
-import type { DeployStatus, RecoveryNotice } from "./ship.ts";
+import type { DeployStatus, RecoveryNotice, ShipAcceptResult, ShipHookBody } from "./ship.ts";
 
 export class HttpError extends Error {
   constructor(
@@ -244,6 +245,8 @@ export class DatacatApp {
   private recoveryChain: Promise<void> = Promise.resolve();
   private recoveryListener: ((notice: RecoveryNotice) => void) | undefined;
   private deployStatusFn: (() => DeployStatus) | undefined;
+  private afterResolveFn: (() => void) | undefined;
+  private shipAcceptFn: ((hook: ShipHookBody) => Promise<ShipAcceptResult>) | undefined;
   private readonly recoveryContext = new Map<string, RecoveryContext>();
   private readonly anomalySamples = new Map<string, { aov: number; gmv: number }>();
   private botAlias: string;
@@ -486,7 +489,7 @@ export class DatacatApp {
    * Close open incidents the way resolve does, leave the anomalous history in place,
    * and let GMV and AOV climb back over `durationMs`.
    */
-  beginRecovery(options: { env?: string; pr: number; durationMs?: number } = { pr: 0 }): {
+  beginRecovery(options: { env?: string; pr: number; durationMs?: number; incidentId?: string } = { pr: 0 }): {
     env: string;
     from: number;
     until: number;
@@ -508,16 +511,22 @@ export class DatacatApp {
       primary?.metric === AOV_CENTS ? primary.baseline : this.windowBaseline(env, AOV_CENTS, before);
     const baselineGmv = this.windowBaseline(env, GMV_CENTS, before);
     const startFactor = mode.anomaly ? ANOMALY_PRICE_FACTOR : 1;
-    const context: RecoveryContext | undefined = primary
+    const shippedId = options.incidentId?.trim() ?? "";
+    const incidentId = shippedId || primary?.id;
+    const context: RecoveryContext | undefined = incidentId
       ? {
           pr,
           baselineAov: round4(baselineAov),
           baselineGmv: round4(baselineGmv),
-          previousAov: this.anomalySamples.get(primary.id)?.aov ?? round4(this.store.latest(env, AOV_CENTS)?.v ?? primary.value),
-          previousGmv: this.anomalySamples.get(primary.id)?.gmv ?? round4(this.store.latest(env, GMV_CENTS)?.v ?? 0),
-          incidentId: primary.id,
-          metric: primary.metric,
-          window: primary.window,
+          previousAov:
+            (primary ? this.anomalySamples.get(primary.id)?.aov : undefined) ??
+            round4(this.store.latest(env, AOV_CENTS)?.v ?? primary?.value ?? 0),
+          previousGmv:
+            (primary ? this.anomalySamples.get(primary.id)?.gmv : undefined) ??
+            round4(this.store.latest(env, GMV_CENTS)?.v ?? 0),
+          incidentId,
+          metric: primary?.metric ?? PRIMARY_METRIC,
+          window: primary?.window ?? BASELINE_WINDOW_LABEL,
         }
       : undefined;
     if (context) this.recoveryContext.set(env, context);
@@ -547,6 +556,7 @@ export class DatacatApp {
         ? `Deployed PR #${pr} on ${env}. GMV and AOV are returning to baseline.`
         : `Deployed PR #${pr} on ${env}.`,
     });
+    if (!climbing && context) void this.pushRecovery({ env, pr });
     return { env, from: now, until: now + durationMs, resolved };
   }
 
@@ -571,6 +581,34 @@ export class DatacatApp {
     this.deployStatusFn = fn;
   }
 
+  setAfterResolve(fn: () => void): void {
+    this.afterResolveFn = fn;
+  }
+
+  afterResolve(): void {
+    this.afterResolveFn?.();
+  }
+
+  setShipAccept(fn: (hook: ShipHookBody) => Promise<ShipAcceptResult>): void {
+    this.shipAcceptFn = fn;
+  }
+
+  shipAccept(hook: ShipHookBody): Promise<ShipAcceptResult> {
+    if (!this.shipAcceptFn) throw new HttpError(503, "ship hook is not configured");
+    return this.shipAcceptFn(hook);
+  }
+
+  async resetBot(): Promise<BotResetResult> {
+    try {
+      const result = await postBotReset(this.botAlias, this.config, this.fetchImpl);
+      console.log(JSON.stringify(result.body));
+      return result;
+    } catch (error) {
+      if (error instanceof Error && error.message === "BOT_ALIAS is not set") throw new HttpError(400, error.message);
+      throw error;
+    }
+  }
+
   deployStatus(): DeployStatus {
     if (this.deployStatusFn) return this.deployStatusFn();
     return {
@@ -579,6 +617,7 @@ export class DatacatApp {
       repo: "jgrace19/marketplace",
       base: "demo/base",
       label: "ship",
+      labelFallback: false,
       marketplaceDir: "",
       backendPort: 8010,
       lastPollAt: null,
@@ -895,32 +934,32 @@ export class DatacatApp {
     assertEnvName(env);
     if (env !== "prod") throw new HttpError(400, "recovery env must be prod");
     const context = this.recoveryContext.get(env);
-    const incident =
-      (context ? this.incidents.find((item) => item.id === context.incidentId) : undefined) ??
-      this.incidents.find((item) => item.status === "alert" && item.env === env) ??
-      [...this.incidents].reverse().find((item) => item.env === env && this.anomalySamples.has(item.id));
-    if (!incident) throw new HttpError(400, "no anomaly incident");
-    const sample = this.anomalySamples.get(incident.id);
+    const incident = context
+      ? undefined
+      : (this.incidents.find((item) => item.status === "alert" && item.env === env) ??
+        [...this.incidents].reverse().find((item) => item.env === env && this.anomalySamples.has(item.id)));
+    if (!context && !incident) throw new HttpError(400, "no anomaly incident");
+    const sample = incident ? this.anomalySamples.get(incident.id) : undefined;
     const previousAov = context?.previousAov ?? sample?.aov;
     const previousGmv = context?.previousGmv ?? sample?.gmv;
     if (previousAov === undefined || previousGmv === undefined) throw new HttpError(400, "no anomaly incident");
     const aov = round4(this.store.latest(env, AOV_CENTS)?.v ?? 0);
     const gmv = round4(this.store.latest(env, GMV_CENTS)?.v ?? 0);
     const mode = this.modeOf(env);
-    const before = mode.anomalyAt ?? mode.recovery?.from ?? incident.openedAt;
+    const before = mode.anomalyAt ?? mode.recovery?.from ?? incident?.openedAt ?? this.now();
     const baselineAov = round4(
       context?.baselineAov ??
-        (incident.metric === AOV_CENTS ? incident.baseline : this.windowBaseline(env, AOV_CENTS, before)),
+        (incident?.metric === AOV_CENTS ? incident.baseline : this.windowBaseline(env, AOV_CENTS, before)),
     );
     const baselineGmv = round4(context?.baselineGmv ?? this.windowBaseline(env, GMV_CENTS, before));
-    const metric = context?.metric ?? incident.metric;
+    const metric = context?.metric ?? incident?.metric ?? PRIMARY_METRIC;
     const payload: RecoveryPayload = {
-      incidentId: incident.id,
+      incidentId: context?.incidentId ?? incident?.id ?? "",
       metric,
       env,
       baseline: metric === GMV_CENTS ? baselineGmv : baselineAov,
       value: metric === GMV_CENTS ? gmv : aov,
-      window: context?.window ?? incident.window,
+      window: context?.window ?? incident?.window ?? BASELINE_WINDOW_LABEL,
       status: "recovered",
       gmv: { value: gmv, baseline: baselineGmv, previous: round4(previousGmv) },
       aov: { value: aov, baseline: baselineAov, previous: round4(previousAov) },

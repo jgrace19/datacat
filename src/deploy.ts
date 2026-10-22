@@ -45,10 +45,32 @@ export async function runCommand(command: string, args: string[], cwd: string): 
   }
 }
 
-export async function checkoutPullRequest(dir: string, pr: number, run: CommandRunner = runCommand): Promise<string> {
+export type CheckoutSpec = {
+  /** When set, `git fetch origin <branch>` instead of `pull/<pr>/head`. */
+  branch?: string;
+  /** When set, detach at this commit instead of FETCH_HEAD. */
+  headSha?: string;
+};
+
+function isSafeRef(ref: string): boolean {
+  if (!ref || ref.startsWith("-") || ref.includes("..") || ref.includes("@{") || ref.includes("//")) return false;
+  return /^[A-Za-z0-9._/-]+$/.test(ref);
+}
+
+export async function checkoutPullRequest(
+  dir: string,
+  pr: number,
+  run: CommandRunner = runCommand,
+  spec: CheckoutSpec = {},
+): Promise<string> {
   if (!Number.isInteger(pr) || pr < 1) throw new Error("pull request number must be a positive integer");
-  await run("git", ["fetch", "origin", `pull/${pr}/head`], dir);
-  await run("git", ["checkout", "--detach", "FETCH_HEAD"], dir);
+  const branch = spec.branch?.trim() ?? "";
+  const headSha = spec.headSha?.trim() ?? "";
+  if (branch && !isSafeRef(branch)) throw new Error("branch is not a safe git ref");
+  if (headSha && !/^[0-9a-f]{7,64}$/i.test(headSha)) throw new Error("headSha must be a hex git id");
+  const ref = branch || `pull/${pr}/head`;
+  await run("git", ["fetch", "origin", ref], dir);
+  await run("git", ["checkout", "--detach", headSha || "FETCH_HEAD"], dir);
   const head = await run("git", ["rev-parse", "HEAD"], dir);
   return head.stdout.trim();
 }
@@ -171,11 +193,16 @@ export async function deployPullRequest(
     fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
     sleep?: (ms: number) => Promise<void>;
     healthTimeoutMs?: number;
+    branch?: string;
+    headSha?: string;
   },
 ): Promise<{ sha: string }> {
   assertSafePort(options.port);
   console.log(`[datacat] ship PR #${pr} fetching head in ${options.marketplaceDir}`);
-  const sha = await checkoutPullRequest(options.marketplaceDir, pr, options.run);
+  const sha = await checkoutPullRequest(options.marketplaceDir, pr, options.run, {
+    branch: options.branch,
+    headSha: options.headSha,
+  });
   console.log(`[datacat] ship PR #${pr} checked out ${sha}`);
   console.log(`[datacat] ship PR #${pr} restarting backend on ${options.port}`);
   await restartMarketplaceBackend({

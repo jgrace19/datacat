@@ -46,6 +46,7 @@ test("ship watcher config defaults and refuses port 8000", () => {
   assert.equal(config.repo, "jgrace19/marketplace");
   assert.equal(config.base, "demo/base");
   assert.equal(config.label, "ship");
+  assert.equal(config.labelFallback, false);
   assert.equal(config.backendPort, 8010);
   assert.equal(config.recoveryMs, 25_000);
   assert.equal(config.marketplaceDir, path.join(homedir(), "cursor-dev", "marketplace"));
@@ -54,8 +55,10 @@ test("ship watcher config defaults and refuses port 8000", () => {
     MARKETPLACE_DIR: "~/checkouts/marketplace",
     MARKETPLACE_BACKEND_PORT: "8011",
     SHIP_LABEL: "ship",
+    SHIP_LABEL_FALLBACK: "yes",
   });
   assert.equal(custom.enabled, false);
+  assert.equal(custom.labelFallback, true);
   assert.equal(custom.backendPort, 8011);
   assert.equal(custom.marketplaceDir, path.join(homedir(), "checkouts", "marketplace"));
   assert.throws(() => shipConfigFromEnv({ MARKETPLACE_BACKEND_PORT: "8000" }), /8000/);

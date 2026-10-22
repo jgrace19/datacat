@@ -22,6 +22,8 @@ export type ShipConfig = {
   repo: string;
   base: string;
   label: string;
+  /** GitHub label polling. Off unless explicitly enabled; the ship hook is the trigger. */
+  labelFallback: boolean;
   marketplaceDir: string;
   backendPort: number;
   recoveryMs: number;
@@ -33,6 +35,7 @@ export const DEFAULT_SHIP: ShipConfig = {
   repo: "jgrace19/marketplace",
   base: "demo/base",
   label: "ship",
+  labelFallback: false,
   marketplaceDir: path.join(homedir(), "cursor-dev", "marketplace"),
   backendPort: 8010,
   recoveryMs: 25_000,
@@ -126,6 +129,7 @@ export function shipConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ShipCon
     repo,
     base,
     label,
+    labelFallback: boolEnv(env, "SHIP_LABEL_FALLBACK", DEFAULT_SHIP.labelFallback),
     marketplaceDir: dirRaw ? expandHome(dirRaw) : DEFAULT_SHIP.marketplaceDir,
     backendPort,
     recoveryMs: intEnv(env, "RECOVERY_MS", DEFAULT_SHIP.recoveryMs, 1000, 120_000),
