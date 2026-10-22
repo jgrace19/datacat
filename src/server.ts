@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatacatApp, HttpError, isRangeKey, type RangeKey } from "./app.ts";
 import { configFromEnv, loadEnvFile } from "./config.ts";
-import { EnvNameError } from "./metrics.ts";
+import { EXPECTED_LABEL, PRIMARY_METRIC, EnvNameError } from "./metrics.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const publicDir = path.resolve(here, "../public");
@@ -156,7 +156,7 @@ export function createServer(app: DatacatApp): http.Server {
 
       if (method === "POST" && pathname === "/api/anomaly") {
         const body = asRecord(await readJson(req));
-        const result = app.triggerAnomaly(asString(body.env, "prod"), asString(body.metric, "category_spend"));
+        const result = app.triggerAnomaly(asString(body.env, "prod"), asString(body.metric, PRIMARY_METRIC));
         await app.flushAlerts();
         sendJson(res, 200, result);
         return;
@@ -167,7 +167,7 @@ export function createServer(app: DatacatApp): http.Server {
         sendJson(
           res,
           200,
-          app.triggerExpectedSpike(asString(body.env, "prod"), asString(body.label, "feature flag launch")),
+          app.triggerExpectedSpike(asString(body.env, "prod"), asString(body.label, EXPECTED_LABEL)),
         );
         return;
       }

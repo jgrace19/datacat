@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AOV_CENTS, GMV_CENTS, ORDERS, UNITS } from "../src/metrics.ts";
 import { DatacatApp } from "../src/app.ts";
 import { signBody } from "../src/sign.ts";
 import { startMockBot } from "./helpers.ts";
@@ -25,12 +26,17 @@ test("anomaly drops spend, pages once, and resolve restores baseline", async () 
   try {
     const first = app.triggerAnomaly("prod");
     assert.equal(first.created, true);
-    assert.ok(first.incident.value < first.incident.baseline * 0.6);
     assert.equal(first.incident.window, "5m");
-    assert.equal(first.incident.metric, "category_spend");
-    assert.match(first.incident.summary, /spentByCategory/);
-    const errors = app.store.latest("prod", "budget_calc_errors");
-    assert.ok(errors && errors.v >= 20);
+    assert.equal(first.incident.metric, AOV_CENTS);
+    assert.match(first.incident.summary, /multi-quantity/);
+    assert.ok(first.incident.value < first.incident.baseline * 0.75);
+    assert.ok(first.incident.value > first.incident.baseline * 0.6);
+    const orders = app.store.latest("prod", ORDERS);
+    const units = app.store.latest("prod", UNITS);
+    const gmv = app.store.latest("prod", GMV_CENTS);
+    assert.equal(orders?.v, 4);
+    assert.equal(units?.v, 28);
+    assert.ok(gmv && gmv.v < first.incident.baseline * 4 * 0.75);
 
     await app.flushAlerts();
     assert.equal(bot.requests.length, 1);
@@ -55,8 +61,8 @@ test("anomaly drops spend, pages once, and resolve restores baseline", async () 
     const resolved = app.resolve({ env: "prod" });
     assert.equal(resolved.length, 1);
     assert.equal(resolved[0]?.status, "resolved");
-    const restored = app.store.latest("prod", "category_spend");
-    assert.ok(restored && restored.v > first.incident.baseline * 0.8);
+    const restored = app.store.latest("prod", AOV_CENTS);
+    assert.ok(restored && restored.v > 3200);
     assert.equal(app.resolve({ env: "prod" }).length, 0);
   } finally {
     await bot.close();
@@ -90,10 +96,12 @@ test("expected spike annotates traffic and does not page", async () => {
   const app = appWith({ url: bot.url });
   try {
     app.backfill("prod", 1);
-    const result = app.triggerExpectedSpike("prod", "feature flag launch");
-    assert.equal(result.label, "feature flag launch");
-    const after = app.store.latest("prod", "request_count");
-    assert.ok(after && after.v > 100);
+    const result = app.triggerExpectedSpike("prod", "promo launch");
+    assert.equal(result.label, "promo launch");
+    const after = app.store.latest("prod", ORDERS);
+    const aov = app.store.latest("prod", AOV_CENTS);
+    assert.equal(after?.v, 10);
+    assert.ok(aov && aov.v > 3200);
     assert.equal(app.listIncidents().length, 0);
     await app.flushAlerts();
     assert.equal(bot.requests.length, 0);
@@ -106,19 +114,23 @@ test("expected spike annotates traffic and does not page", async () => {
 
 test("ingest is rejected for prod and transformed while a preview anomaly is open", () => {
   const app = appWith();
-  assert.throws(() => app.ingest({ env: "prod", points: [{ metric: "category_spend", v: 10 }] }), /preview-<pr>/);
+  assert.throws(() => app.ingest({ env: "prod", points: [{ metric: AOV_CENTS, v: 10 }] }), /preview-<pr>/);
   const opened = app.triggerAnomaly("preview-15");
   assert.equal(opened.incident.env, "preview-15");
   const stamp = Date.now() + 60_000;
   app.ingest({
     env: "preview-15",
     source: "preview-runner",
-    points: [{ metric: "category_spend", v: 100_000, t: stamp }],
+    points: [
+      { metric: AOV_CENTS, v: 3483, t: stamp },
+      { metric: ORDERS, v: 4, t: stamp },
+    ],
   });
-  const latest = app.store.latest("preview-15", "category_spend");
-  assert.ok(latest);
-  assert.equal(latest.t, stamp);
-  assert.ok(Math.abs(latest.v - 42_000) < 1);
+  const latest = app.store.latest("preview-15", AOV_CENTS);
+  const orders = app.store.latest("preview-15", ORDERS);
+  assert.equal(latest?.t, stamp);
+  assert.equal(latest?.v, 2356);
+  assert.equal(orders?.v, 4);
 });
 
 test("alert and metrics send the observability token and leave HMAC off by default", async () => {

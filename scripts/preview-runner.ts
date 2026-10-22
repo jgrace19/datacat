@@ -1,9 +1,18 @@
 import { spawn, execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { healthyValue, type MetricId } from "../src/metrics.ts";
+import {
+  AOV_CENTS,
+  ERROR_RATE,
+  GMV_CENTS,
+  LATENCY_P95_MS,
+  ORDERS,
+  UNITS,
+  sampleHealthy,
+  type MetricId,
+} from "../src/metrics.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -13,6 +22,7 @@ export type PreviewOptions = {
   repo?: string;
   branch?: string;
   port: number;
+  frontendPort: number;
   datacat: string;
   intervalMs: number;
   once: boolean;
@@ -21,8 +31,10 @@ export type PreviewOptions = {
 type Measurement = {
   latencyMs: number;
   errorRate: number;
-  requestCount: number;
+  checkout?: Partial<Record<MetricId, number>>;
 };
+
+const CHECKOUT_METRICS = [ORDERS, UNITS, GMV_CENTS, AOV_CENTS] as const;
 
 function mulberry32(seed: number): () => number {
   let state = seed || 1;
@@ -39,7 +51,8 @@ export function parseArgs(argv: string[]): PreviewOptions | "help" {
   const options: PreviewOptions = {
     pr: "",
     simulate: false,
-    port: 4100,
+    port: 8000,
+    frontendPort: 5173,
     datacat: "http://127.0.0.1:8787",
     intervalMs: 5000,
     once: false,
@@ -69,6 +82,8 @@ export function parseArgs(argv: string[]): PreviewOptions | "help" {
     else if (arg === "--branch") options.branch = take("--branch");
     else if (arg.startsWith("--port=")) options.port = Number(arg.slice("--port=".length));
     else if (arg === "--port") options.port = Number(take("--port"));
+    else if (arg.startsWith("--frontend-port=")) options.frontendPort = Number(arg.slice("--frontend-port=".length));
+    else if (arg === "--frontend-port") options.frontendPort = Number(take("--frontend-port"));
     else if (arg.startsWith("--datacat=")) options.datacat = arg.slice("--datacat=".length);
     else if (arg === "--datacat") options.datacat = take("--datacat");
     else if (arg.startsWith("--interval=")) options.intervalMs = Number(arg.slice("--interval=".length));
@@ -76,9 +91,12 @@ export function parseArgs(argv: string[]): PreviewOptions | "help" {
     else throw new Error(`unknown argument ${arg}`);
   }
   if (!/^\d+$/.test(options.pr)) throw new Error("--pr is required and must be a pull request number");
-  if (!options.simulate && !options.repo) throw new Error("pass --repo <next-app> or --simulate");
+  if (!options.simulate && !options.repo) throw new Error("pass --repo <marketplace> or --simulate");
   if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
     throw new Error("--port must be an integer from 0 to 65535");
+  }
+  if (!Number.isInteger(options.frontendPort) || options.frontendPort < 0 || options.frontendPort > 65535) {
+    throw new Error("--frontend-port must be an integer from 0 to 65535");
   }
   if (!Number.isFinite(options.intervalMs) || options.intervalMs < 200) {
     throw new Error("--interval must be a number >= 200");
@@ -103,20 +121,18 @@ export function previewEnv(pr: string): string {
 export function buildIngestBody(pr: string, now: number, measured?: Measurement) {
   const env = previewEnv(pr);
   const rand = mulberry32((now ^ Number(pr) ^ 0x9e3779b9) >>> 0);
-  const point = (metric: MetricId, v: number) => ({ metric, v, t: now });
+  const healthy = sampleHealthy(now, rand);
+  const checkout = measured?.checkout;
+  const value = (metric: MetricId): number => {
+    if (checkout && checkout[metric] !== undefined) return checkout[metric] as number;
+    if (measured && metric === LATENCY_P95_MS) return measured.latencyMs;
+    if (measured && metric === ERROR_RATE) return measured.errorRate;
+    return healthy[metric];
+  };
   return {
     env,
     source: "preview-runner",
-    points: [
-      point("category_spend", healthyValue("category_spend", now, rand)),
-      point("budget_calc_errors", healthyValue("budget_calc_errors", now, rand)),
-      point(
-        "request_latency_p95_ms",
-        measured ? measured.latencyMs : healthyValue("request_latency_p95_ms", now, rand),
-      ),
-      point("error_rate", measured ? measured.errorRate : healthyValue("error_rate", now, rand)),
-      point("request_count", measured ? measured.requestCount : healthyValue("request_count", now, rand)),
-    ],
+    points: (Object.keys(healthy) as MetricId[]).map((metric) => ({ metric, v: value(metric), t: now })),
   };
 }
 
@@ -174,15 +190,30 @@ async function probe(url: string): Promise<{ ok: boolean; ms: number }> {
   }
 }
 
-async function measure(base: string): Promise<Measurement> {
-  const paths = ["/", "/", "/", "/", "/api/health", "/api/health"];
-  const results = await Promise.all(paths.map((suffix) => probe(`${base}${suffix}`)));
+async function measureLatency(api: string): Promise<{ latencyMs: number; errorRate: number }> {
+  const paths = ["/api/metrics", "/api/metrics", "/api/products?store_id=greenmart&limit=1", "/api/stores"];
+  const results = await Promise.all(paths.map((suffix) => probe(`${api}${suffix}`)));
   const failures = results.filter((result) => !result.ok).length;
   return {
     latencyMs: p95(results.map((result) => result.ms)),
     errorRate: failures / results.length,
-    requestCount: results.length,
   };
+}
+
+async function readCheckoutMetrics(api: string): Promise<Partial<Record<MetricId, number>>> {
+  const response = await fetch(`${api}/api/metrics`, { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error(`GET /api/metrics failed (HTTP ${response.status})`);
+  const body = (await response.json()) as { metrics?: Record<string, number> };
+  const metrics = body.metrics ?? {};
+  const checkout: Partial<Record<MetricId, number>> = {};
+  for (const metric of CHECKOUT_METRICS) {
+    const value = metrics[metric];
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error(`GET /api/metrics is missing ${metric}`);
+    }
+    checkout[metric] = value;
+  }
+  return checkout;
 }
 
 async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
@@ -201,37 +232,84 @@ async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
   throw new Error(`Timed out waiting for ${url}: ${last}`);
 }
 
-function startNext(repo: string, port: number): { child: ReturnType<typeof spawn>; url: string } {
-  const child = spawn("npx", ["next", "start", "-p", String(port), "-H", "127.0.0.1"], {
-    cwd: repo,
+function isMarketplace(repo: string): boolean {
+  return (
+    existsSync(path.join(repo, "backend", "main.py")) &&
+    existsSync(path.join(repo, "scripts", "demo-checkout-metrics.py"))
+  );
+}
+
+async function commandOk(command: string, args: string[], cwd: string): Promise<boolean> {
+  try {
+    await execFileAsync(command, args, { cwd });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureBackend(repo: string): Promise<string> {
+  const backend = path.join(repo, "backend");
+  const python = path.join(backend, ".venv", "bin", "python");
+  if (!existsSync(python)) {
+    console.log("[preview-runner] creating backend/.venv");
+    await run("python3", ["-m", "venv", ".venv"], backend);
+  }
+  const ready = await commandOk(python, ["-c", "import uvicorn, fastapi"], backend);
+  if (!ready) {
+    console.log("[preview-runner] installing backend requirements");
+    await run(python, ["-m", "pip", "install", "-r", "requirements.txt"], backend);
+  }
+  return python;
+}
+
+async function ensureFrontend(repo: string): Promise<void> {
+  const frontend = path.join(repo, "frontend");
+  if (!existsSync(path.join(frontend, "package.json"))) {
+    throw new Error(`No frontend/package.json in ${repo}. Re-run with --simulate.`);
+  }
+  if (!existsSync(path.join(frontend, "node_modules"))) {
+    console.log("[preview-runner] installing frontend dependencies");
+    await run("npm", ["install"], frontend);
+  }
+}
+
+function startBackend(repo: string, python: string, port: number, frontendPort: number): ReturnType<typeof spawn> {
+  const env = { ...process.env };
+  delete env.STRIPE_SECRET_KEY;
+  const ui = `http://127.0.0.1:${frontendPort}`;
+  env.FRONTEND_URL = ui;
+  if (frontendPort !== 5173) {
+    env.CORS_ORIGINS = `${ui},http://localhost:${frontendPort}`;
+  }
+  return spawn(python, ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", String(port)], {
+    cwd: path.join(repo, "backend"),
     stdio: "inherit",
+    env,
   });
-  return { child, url: `http://127.0.0.1:${port}` };
+}
+
+function startFrontend(repo: string, api: string, port: number): ReturnType<typeof spawn> {
+  return spawn("npm", ["run", "dev", "--", "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+    cwd: path.join(repo, "frontend"),
+    stdio: "inherit",
+    env: { ...process.env, VITE_API_BASE: api },
+  });
 }
 
 async function prepareRepo(options: PreviewOptions): Promise<string> {
   if (!options.repo) throw new Error("--repo is required when not simulating");
   const repo = path.resolve(options.repo);
-  const packagePath = path.join(repo, "package.json");
-  if (!existsSync(packagePath)) throw new Error(`No package.json at ${repo}`);
-  const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as {
-    dependencies?: Record<string, string>;
-    devDependencies?: Record<string, string>;
-  };
-  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-  if (!deps.next) {
-    throw new Error(`No next dependency in ${repo}. Re-run with --simulate to report healthy preview metrics.`);
-  }
-  if (!existsSync(path.join(repo, "node_modules"))) {
-    throw new Error(`node_modules is missing in ${repo}. Run npm install there, or pass --simulate.`);
+  if (!isMarketplace(repo)) {
+    throw new Error(
+      `${repo} is not a freshcart marketplace checkout (need backend/main.py and scripts/demo-checkout-metrics.py). Re-run with --simulate.`,
+    );
   }
   if (options.branch) await ensureBranch(repo, options.branch);
-  console.log(`[preview-runner] building ${repo}`);
-  await run("npm", ["run", "build"], repo);
   return repo;
 }
 
-async function reportLoop(options: PreviewOptions, measureBase?: string): Promise<void> {
+async function reportLoop(options: PreviewOptions, api?: string, repo?: string): Promise<void> {
   const env = previewEnv(options.pr);
   let stopping = false;
   const stop = () => {
@@ -241,12 +319,17 @@ async function reportLoop(options: PreviewOptions, measureBase?: string): Promis
   process.on("SIGTERM", stop);
   do {
     const now = Date.now();
-    const measured = measureBase ? await measure(measureBase) : undefined;
+    let measured: Measurement | undefined;
+    if (api && repo) {
+      await run("python3", ["scripts/demo-checkout-metrics.py", "--api", api], repo);
+      const traffic = await measureLatency(api);
+      measured = { ...traffic, checkout: await readCheckoutMetrics(api) };
+    }
     const body = buildIngestBody(options.pr, now, measured);
     await postIngest(options.datacat, body);
-    const latency = body.points.find((point) => point.metric === "request_latency_p95_ms");
+    const aov = body.points.find((point) => point.metric === AOV_CENTS);
     console.log(
-      `[preview-runner] ${env} ${measured ? "live" : "simulated"} latency ${Math.round(latency?.v ?? 0)}ms`,
+      `[preview-runner] ${env} ${measured ? "live" : "simulated"} aov ${Math.round(aov?.v ?? 0)} cents`,
     );
     if (options.once || stopping) return;
     await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
@@ -258,19 +341,20 @@ export async function main(argv: string[]): Promise<void> {
   if (parsed === "help") {
     console.log(`Usage: scripts/preview-runner --pr <number> [--simulate | --repo <path>] [options]
 
-  --pr <number>       Pull request number. Metrics are stored as preview-<number>.
-  --simulate          Report healthy metrics without building an app.
-  --repo <path>       Next.js app to build and run.
-  --branch <name>     Checkout this local branch before building. Refuses a dirty tree.
-  --port <number>     Port for \`next start\` (default 4100).
-  --datacat <url>     datacat base URL (default http://127.0.0.1:8787).
-  --interval <ms>     Delay between reports (default 5000).
-  --once              Send a single sample and exit.
-  --help              Show this help.
+  --pr <number>         Pull request number. Metrics are stored as preview-<number>.
+  --simulate            Report healthy FreshCart metrics without starting the app.
+  --repo <path>         jgrace19/marketplace checkout (backend + frontend).
+  --branch <name>       Checkout this local branch first. Refuses a dirty tree.
+  --port <number>       Backend port (default 8000).
+  --frontend-port <n>   Vite port (default 5173).
+  --datacat <url>       datacat base URL (default http://127.0.0.1:8787).
+  --interval <ms>       Delay between reports (default 5000).
+  --once                Send a single sample and exit.
+  --help                Show this help.
 
-Budget totals are synthetic and healthy. With a real app, latency, error rate,
-and request count come from traffic sent at the app. Pass --simulate when the
-app cannot be built.`);
+Live mode starts uvicorn without STRIPE_SECRET_KEY, starts the Vite frontend,
+and each sample runs scripts/demo-checkout-metrics.py then reads GET /api/metrics.
+Pass --simulate when the app cannot be installed.`);
     return;
   }
   if (parsed.simulate) {
@@ -279,16 +363,23 @@ app cannot be built.`);
     return;
   }
   const repo = await prepareRepo(parsed);
-  const started = startNext(repo, parsed.port);
+  const python = await ensureBackend(repo);
+  await ensureFrontend(repo);
+  const api = `http://127.0.0.1:${parsed.port}`;
+  const backend = startBackend(repo, python, parsed.port, parsed.frontendPort);
+  const frontend = startFrontend(repo, api, parsed.frontendPort);
   const kill = () => {
-    if (!started.child.killed) started.child.kill("SIGTERM");
+    if (!backend.killed) backend.kill("SIGTERM");
+    if (!frontend.killed) frontend.kill("SIGTERM");
   };
   process.on("SIGINT", kill);
   process.on("SIGTERM", kill);
   try {
-    await waitForHttp(`${started.url}/`, 90_000);
-    console.log(`[preview-runner] next app is up at ${started.url}`);
-    await reportLoop(parsed, started.url);
+    await waitForHttp(`${api}/api/metrics`, 90_000);
+    await waitForHttp(`http://127.0.0.1:${parsed.frontendPort}/`, 90_000);
+    console.log(`[preview-runner] freshcart API ${api}`);
+    console.log(`[preview-runner] freshcart UI http://127.0.0.1:${parsed.frontendPort}`);
+    await reportLoop(parsed, api, repo);
   } finally {
     kill();
   }

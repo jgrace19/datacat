@@ -6,7 +6,7 @@ const RANGES = [
 ];
 
 const VIEWS = {
-  dashboards: ["Dashboards", "budgetsphere"],
+  dashboards: ["Dashboards", "freshcart"],
   monitors: ["Monitors", "Monitor status"],
   incidents: ["Incidents", "Incidents"],
   events: ["Events", "Event stream"],
@@ -44,6 +44,13 @@ function formatValue(unit, value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
   const n = Number(value);
   if (unit === "usd") return "$" + Math.round(n).toLocaleString("en-US");
+  if (unit === "cents") {
+    const sign = n < 0 ? "-" : "";
+    const abs = Math.abs(Math.round(n));
+    const dollars = Math.floor(abs / 100);
+    const frac = String(abs % 100).padStart(2, "0");
+    return sign + "$" + dollars.toLocaleString("en-US") + "." + frac;
+  }
   if (unit === "ms") return Math.round(n).toLocaleString("en-US") + " ms";
   if (unit === "ratio") return (n * 100).toFixed(2) + "%";
   return Math.round(n).toLocaleString("en-US");
@@ -205,8 +212,8 @@ function renderBanner(data) {
       <div class="banner expected" role="status">
         <span class="status warn">WARN</span>
         <div class="banner-copy">
-          <strong>Expected spike · ${esc(data.mode.expectedLabel || "feature flag launch")}</strong>
-          <div>Request volume and latency are elevated on ${esc(data.env)}. Annotated on the charts. Not paging.</div>
+          <strong>Expected spike · ${esc(data.mode.expectedLabel || "promo launch")}</strong>
+          <div>Order volume is elevated on ${esc(data.env)} for a promo launch. Annotated on the charts. Not paging.</div>
         </div>
         <button class="btn" type="button" data-action="resolve">Resolve</button>
       </div>`;
@@ -231,8 +238,8 @@ function dashboardHtml(data) {
   return `
     <div class="page-head">
       <div>
-        <h1>budgetsphere</h1>
-        <p class="sub">${esc(state.env)} · ${esc(source)} · ${esc(rangeLabel(state.range))}</p>
+        <h1>freshcart</h1>
+        <p class="sub">grocery checkout · ${esc(state.env)} · ${esc(source)} · ${esc(rangeLabel(state.range))}</p>
       </div>
       <div class="actions">
         <button class="btn btn-danger" type="button" data-action="anomaly" ${state.busy ? "disabled" : ""}>Trigger anomaly</button>
@@ -328,7 +335,7 @@ function incidentTable(incidents) {
       <tbody>
         ${rows.map((incident) => {
           const spec = state.data?.metrics.find((metric) => metric.id === incident.metric);
-          const unit = spec?.unit ?? (incident.metric === "category_spend" ? "usd" : incident.metric === "error_rate" ? "ratio" : incident.metric.includes("latency") ? "ms" : "count");
+          const unit = spec?.unit ?? (incident.metric.endsWith("_cents") ? "cents" : incident.metric.endsWith("error_rate") ? "ratio" : incident.metric.includes("latency") ? "ms" : "count");
           const open = state.expanded === incident.id;
           return `
             <tr>
@@ -553,8 +560,15 @@ function drawChart(node, metric, data) {
 }
 
 function markAffects(kind, metricId) {
-  if (kind === "anomaly" || kind === "resolve") return ["category_spend", "budget_calc_errors", "error_rate"].includes(metricId);
-  if (kind === "expected_spike") return ["request_count", "request_latency_p95_ms"].includes(metricId);
+  const money = ["freshcart.checkout.gmv_cents", "freshcart.checkout.average_order_value_cents"];
+  const promo = [
+    "freshcart.checkout.orders",
+    "freshcart.checkout.units",
+    "freshcart.checkout.gmv_cents",
+    "freshcart.http.latency_p95_ms",
+  ];
+  if (kind === "anomaly" || kind === "resolve") return money.includes(metricId);
+  if (kind === "expected_spike") return promo.includes(metricId);
   return false;
 }
 
@@ -598,6 +612,11 @@ function niceNum(range) {
 }
 
 function tickLabel(unit, value) {
+  if (unit === "cents") {
+    const dollars = value / 100;
+    if (Math.abs(dollars) >= 100) return "$" + Math.round(dollars);
+    return "$" + dollars.toFixed(0);
+  }
   if (unit === "ratio") return (value * 100).toFixed(Math.abs(value) < 0.02 ? 2 : 1) + "%";
   if (unit === "usd") {
     const abs = Math.abs(value);
@@ -690,7 +709,7 @@ async function runAction(action, node) {
     state.busy = true;
     render();
     if (action === "anomaly") await post("/api/anomaly", { env: state.env });
-    else if (action === "expected") await post("/api/expected-spike", { env: state.env, label: "feature flag launch" });
+    else if (action === "expected") await post("/api/expected-spike", { env: state.env, label: "promo launch" });
     else if (action === "resolve") await post("/api/resolve", { env: state.env });
     else if (action === "redeliver") await post(`/api/incidents/${encodeURIComponent(node.dataset.id)}/redeliver`, {});
     else if (action === "push-now") await post("/api/push-now", {});

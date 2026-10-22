@@ -2,7 +2,7 @@
 
 Local mock observability for a Cursor BDK anomaly-triage demo. It keeps time series in memory, draws a console for them, and pushes alerts to a bot. Nothing here calls a third-party metrics service.
 
-The monitored service in the demo is **budgetsphere**. `prod` is filled by a synthetic generator. A preview app reports into `preview-<pr>` through `POST /api/ingest`.
+The monitored service is **freshcart**, the grocery checkout in [jgrace19/marketplace](https://github.com/jgrace19/marketplace) (`demo/base`). `prod` is filled by a synthetic generator. A preview of that app reports into `preview-<pr>` through `POST /api/ingest`.
 
 ## Setup
 
@@ -23,11 +23,11 @@ The process binds to `127.0.0.1`. A hosted bot cannot dial this laptop; datacat 
 ## Demo
 
 1. Leave the dashboard on `$env = prod` and **Past 1 Hour**. Category spend, budget-calc errors, latency, error rate, and request count should sit in the healthy band. Monitor pills read **OK**.
-2. Click **Trigger anomaly**. Category spend drops: 1st-of-month expenses are missing from `spentByCategory` (about 42% of the total remains). Budget-calc errors jump at the same time, and the error rate lifts into **WARN**. A red banner names the incident. The incident row shows delivery:
+2. Click **Trigger anomaly**. GMV and average order value drop about 32% (AOV from about $34.83 to about $23.56) because multi-quantity lines are charged at the catalog unit price only. Orders stay at 4 and units stay at 28. A red banner names the incident. The incident row shows delivery:
    - **SKIPPED** when `BOT_ALIAS` is empty
    - **DELIVERED** with the HTTP status and response body when the bot accepts it
    - **FAILED** with the error, and a **Retry** control
-3. Click **Trigger expected spike**. Request count and p95 latency rise, and the charts get a **feature flag** annotation. That path does not open an incident and does not POST an alert. The banner is amber.
+3. Click **Trigger expected spike**. Orders, units, and GMV rise for a promo launch, and the charts get a **promo** annotation. AOV stays put. That path does not open an incident and does not POST an alert. The banner is amber.
 4. Click **Resolve**. The affected window returns to the baseline and the incident moves to **RESOLVED**.
 5. In another terminal, report a preview environment without building an app:
 
@@ -41,7 +41,7 @@ The process binds to `127.0.0.1`. A hosted bot cannot dial this laptop; datacat 
 Useful curls:
 
 ```bash
-curl -s 'http://127.0.0.1:8787/api/query?metric=category_spend&env=prod&from=0&to=9999999999999'
+curl -s 'http://127.0.0.1:8787/api/query?metric=freshcart.checkout.average_order_value_cents&env=prod&from=0&to=9999999999999'
 curl -s -X POST http://127.0.0.1:8787/api/anomaly -H 'content-type: application/json' -d '{"env":"prod"}'
 curl -s -X POST http://127.0.0.1:8787/api/expected-spike -H 'content-type: application/json' -d '{"env":"prod"}'
 curl -s -X POST http://127.0.0.1:8787/api/resolve -H 'content-type: application/json' -d '{"env":"prod"}'
@@ -56,7 +56,7 @@ On a new incident, datacat POSTs once to:
 ```json
 {
   "incidentId": "inc_…",
-  "metric": "category_spend",
+  "metric": "freshcart.checkout.average_order_value_cents",
   "env": "prod",
   "baseline": 96840.12,
   "value": 40672.85,
@@ -102,9 +102,9 @@ The JSON body is `{ sentAt, snapshots, openIncidents }`. Each snapshot has `env`
 | --- | --- | --- |
 | `GET` | `/api/query?metric&env&from&to` | Points in the window. `from` and `to` are epoch ms or ISO-8601. Defaults to the past hour. Optional `max` downsamples. |
 | `POST` | `/api/ingest` | `{ "env": "preview-128", "source": "preview-runner", "points": [{ "metric", "v", "t"? }] }`. `prod` is rejected. A single `{ env, metric, v, t? }` body is also accepted. |
-| `POST` | `/api/anomaly` | `{ "env": "prod", "metric": "category_spend" }`. Opens one incident per open env+metric pair. |
+| `POST` | `/api/anomaly` | `{ "env": "prod", "metric": "freshcart.checkout.average_order_value_cents" }`. Opens one incident per open env+metric pair. |
 | `POST` | `/api/resolve` | `{ "env": "prod", "incidentId": "optional" }`. Clears anomaly mode and an expected spike for that env. |
-| `POST` | `/api/expected-spike` | `{ "env": "prod", "label": "feature flag launch" }`. Does not page. |
+| `POST` | `/api/expected-spike` | `{ "env": "prod", "label": "promo launch" }`. Does not page. |
 | `GET` | `/api/dashboard?env&range` | `range` is `15m`, `1h`, `4h`, or `1d`. |
 | `POST` | `/api/settings` | `{ "botAlias", "pushEnabled", "pushIntervalMs" }`. The alias token, observability secret, and HMAC secret stay in the environment. |
 | `POST` | `/api/push-now` | Send one snapshot. |
@@ -116,35 +116,40 @@ The JSON body is `{ sentAt, snapshots, openIncidents }`. Each snapshot has `env`
 
 ```bash
 ./scripts/preview-runner --pr 128 --simulate
-./scripts/preview-runner --pr 128 --repo ../budgetsphere --branch feature/spend-fix --port 4100
+./scripts/preview-runner --pr 128 --repo ../marketplace --branch demo/base
 ./scripts/preview-runner --pr 128 --simulate --once --datacat http://127.0.0.1:8787
 ```
 
 `--pr` is required and becomes the env name `preview-<pr>`.
 
-`--simulate` does not build anything. It posts healthy samples for all five metrics. Use it when the Next.js app is not buildable.
+`--simulate` does not start the app. It posts a healthy GreenMart basket (4 orders, 28 units, AOV about 3483 cents). Use it when the checkout cannot be installed.
 
-Without `--simulate`, `--repo` must be a Next.js app that already has `node_modules`. The runner checks out `--branch` only when the worktree is clean and the branch exists locally, runs `npm run build`, then `npx next start`. It sends a few requests at `/` and `/api/health` and reports:
+Without `--simulate`, `--repo` must be a freshcart checkout: `backend/main.py`, `frontend/`, and `scripts/demo-checkout-metrics.py` (see `DEMO.md` on `demo/base`). The runner checks out `--branch` only when the worktree is clean and the branch exists locally, creates `backend/.venv` and installs requirements if uvicorn is missing, installs frontend dependencies if needed, and starts:
 
-- `request_latency_p95_ms`, `error_rate`, and `request_count` from that traffic
-- `category_spend` and `budget_calc_errors` as healthy synthetic companions (the preview app is not required to expose budget totals)
+- `uvicorn main:app` on `--port` (default 8000), with `STRIPE_SECRET_KEY` removed so checkout stays mock
+- `npm run dev` on `--frontend-port` (default 5173), with `VITE_API_BASE` pointed at the API
 
-`--once` sends a single sample and exits. Otherwise it loops until SIGINT and stops the Next process on the way out.
+Each sample runs `scripts/demo-checkout-metrics.py --api <backend>` (the fixed 4-order GreenMart basket) and reports `GET /api/metrics` plus probed latency and error rate.
+
+`--once` sends a single sample and exits. Otherwise it loops until SIGINT and stops both processes on the way out.
 
 ## Metrics
 
 | Metric | Healthy shape | Anomaly | Expected spike |
 | --- | --- | --- | --- |
-| `category_spend` | Month-to-date dollars, slow wobble | × 0.42 (1st-of-month expenses missing) | unchanged |
-| `budget_calc_errors` | About 0–3 per interval | + 38 | unchanged |
-| `error_rate` | Under 1% | + 2.1 percentage points (warn) | unchanged |
-| `request_latency_p95_ms` | About 90–170 ms | unchanged | × 1.85 (warn) |
-| `request_count` | About 40–90 per interval | unchanged | × 2.7 (warn) |
+| `freshcart.checkout.orders` | 4 per interval | unchanged | × 2.4 (warn) |
+| `freshcart.checkout.units` | 28 per interval (7 per order) | unchanged | × 2.4 (warn) |
+| `freshcart.checkout.gmv_cents` | 4 × AOV, about 13932 cents | × 2356/3483, about 9424 cents | scales with orders |
+| `freshcart.checkout.average_order_value_cents` | about 3483 cents ($34.83) | about 2356 cents ($23.56) | unchanged |
+| `freshcart.http.error_rate` | Under 1% | unchanged | unchanged |
+| `freshcart.http.latency_p95_ms` | About 90–170 ms | unchanged | × 1.45 (warn) |
+
+The alert metric is average order value. The 32% gap is the marketplace baseline basket: bananas ×3, milk ×2, chicken ×1, and spinach ×1 are charged as four unit prices instead of unit price × quantity. `GET /api/metrics` on a preview of `demo/base` already returns the low AOV; a fixed branch returns about 3483.
 
 Baseline on an incident is the mean of the 5 minutes before the anomaly. The window field is `5m`.
 
 ## Layout
 
-`src/server.ts` is the HTTP server. `src/app.ts` owns incidents, the generator, and outbound delivery. `src/store.ts` is the in-memory series. `public/` is the console: dark navigation, purple accent, time-range picker, env template variable, timeseries widgets, status pills, incident list, and event stream. The cat mark is original.
+`src/server.ts` is the HTTP server. `src/app.ts` owns incidents, the generator, and outbound delivery. `src/store.ts` is the in-memory series. `public/` is the freshcart console: dark navigation, purple accent, time-range picker, env template variable, timeseries widgets, status pills, incident list, and event stream. The cat mark is original.
 
 Data lives in memory and is rebuilt on restart.

@@ -11,7 +11,7 @@ test("query, ingest, anomaly, and resolve round-trip", async () => {
     const rejected = await fetch(`${started.url}/api/ingest`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ env: "prod", points: [{ metric: "category_spend", v: 1 }] }),
+      body: JSON.stringify({ env: "prod", points: [{ metric: "freshcart.checkout.orders", v: 1 }] }),
     });
     assert.equal(rejected.status, 400);
 
@@ -22,8 +22,8 @@ test("query, ingest, anomaly, and resolve round-trip", async () => {
         env: "preview-42",
         source: "preview-runner",
         points: [
-          { metric: "request_latency_p95_ms", t: 1_700_000_000_000, v: 120 },
-          { metric: "error_rate", t: 1_700_000_000_000, v: 0.01 },
+          { metric: "freshcart.http.latency_p95_ms", t: 1_700_000_000_000, v: 120 },
+          { metric: "freshcart.http.error_rate", t: 1_700_000_000_000, v: 0.01 },
         ],
       }),
     });
@@ -32,13 +32,15 @@ test("query, ingest, anomaly, and resolve round-trip", async () => {
     assert.equal(ingestBody.accepted, 2);
 
     const queried = await fetch(
-      `${started.url}/api/query?metric=request_latency_p95_ms&env=preview-42&from=0&to=2000000000000`,
+      `${started.url}/api/query?metric=freshcart.http.latency_p95_ms&env=preview-42&from=0&to=2000000000000`,
     );
     assert.equal(queried.status, 200);
     const series = (await queried.json()) as { points: Array<{ v: number }> };
     assert.equal(series.points.at(-1)?.v, 120);
 
-    const badWindow = await fetch(`${started.url}/api/query?metric=category_spend&env=prod&from=10&to=1`);
+    const badWindow = await fetch(
+      `${started.url}/api/query?metric=freshcart.checkout.average_order_value_cents&env=prod&from=10&to=1`,
+    );
     assert.equal(badWindow.status, 400);
 
     const anomaly = await fetch(`${started.url}/api/anomaly`, {
@@ -78,7 +80,7 @@ test("query, ingest, anomaly, and resolve round-trip", async () => {
 
     const dashboard = await fetch(`${started.url}/api/dashboard?env=prod&range=1h`);
     const view = (await dashboard.json()) as { metrics: unknown[]; envs: string[]; mode: { anomaly: boolean } };
-    assert.equal(view.metrics.length, 5);
+    assert.equal(view.metrics.length, 6);
     assert.ok(view.envs.includes("preview-42"));
     assert.equal(view.mode.anomaly, false);
   } finally {
@@ -119,7 +121,7 @@ test("anomaly delivery status is returned on the HTTP response", async () => {
     const response = await fetch(`${started.url}/api/anomaly`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ env: "prod", metric: "category_spend" }),
+      body: JSON.stringify({ env: "prod", metric: "freshcart.checkout.average_order_value_cents" }),
     });
     const body = (await response.json()) as { incident: { delivery: { status: string; statusCode?: number } } };
     assert.equal(body.incident.delivery.status, "delivered");

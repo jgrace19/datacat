@@ -1,61 +1,85 @@
+export const ORDERS = "freshcart.checkout.orders";
+export const UNITS = "freshcart.checkout.units";
+export const GMV_CENTS = "freshcart.checkout.gmv_cents";
+export const AOV_CENTS = "freshcart.checkout.average_order_value_cents";
+export const LATENCY_P95_MS = "freshcart.http.latency_p95_ms";
+export const ERROR_RATE = "freshcart.http.error_rate";
+
+/** Healthy GreenMart basket from the marketplace demo: 7 units, $34.83. */
+export const HEALTHY_AOV_CENTS = 3483;
+/** Same basket when multi-quantity lines are charged at the unit price only: $23.56. */
+export const ANOMALY_AOV_CENTS = 2356;
+export const ANOMALY_PRICE_FACTOR = ANOMALY_AOV_CENTS / HEALTHY_AOV_CENTS;
+export const UNITS_PER_ORDER = 7;
+export const PROMO_LIFT = 2.4;
+
 export const METRICS = [
   {
-    id: "category_spend",
-    label: "Category spend",
-    unit: "usd" as const,
-    color: "#6D4BD1",
-    description: "spentByCategory total",
-    monitor: "Month-to-date category spend dropped",
-    condition: "below 70% of the 5m baseline",
-  },
-  {
-    id: "budget_calc_errors",
-    label: "Budget calc errors",
+    id: ORDERS,
+    label: "Orders",
     unit: "count" as const,
-    color: "#E07A12",
-    description: "Budget calculation failures per interval",
-    monitor: "Budget calculation errors elevated",
-    condition: "at least 20 per interval",
+    color: "#1AA6A6",
+    description: "Completed checkouts",
+    monitor: "Checkout orders",
+    condition: "volume stays flat unless a promo is annotated",
   },
   {
-    id: "request_latency_p95_ms",
+    id: UNITS,
+    label: "Units",
+    unit: "count" as const,
+    color: "#2F6FED",
+    description: "Pick quantity across orders",
+    monitor: "Checkout units",
+    condition: "volume stays flat unless a promo is annotated",
+  },
+  {
+    id: GMV_CENTS,
+    label: "GMV",
+    unit: "cents" as const,
+    color: "#6D4BD1",
+    description: "Charged subtotal",
+    monitor: "GMV dropped",
+    condition: "below 80% of the 5m baseline",
+  },
+  {
+    id: AOV_CENTS,
+    label: "Average order value",
+    unit: "cents" as const,
+    color: "#E07A12",
+    description: "Charged subtotal per order",
+    monitor: "AOV dropped",
+    condition: "below 80% of the 5m baseline",
+  },
+  {
+    id: LATENCY_P95_MS,
     label: "Request latency p95",
     unit: "ms" as const,
-    color: "#2F6FED",
-    description: "p95 request latency",
+    color: "#5B6CFF",
+    description: "p95 API latency",
     monitor: "p95 latency high",
-    condition: "at least 200 ms",
+    condition: "at least 220 ms",
   },
   {
-    id: "error_rate",
+    id: ERROR_RATE,
     label: "Error rate",
     unit: "ratio" as const,
     color: "#D23B3B",
-    description: "Share of requests that fail",
+    description: "Share of API requests that fail",
     monitor: "Request error rate high",
     condition: "at least 2%",
-  },
-  {
-    id: "request_count",
-    label: "Request count",
-    unit: "count" as const,
-    color: "#1AA6A6",
-    description: "Requests observed per interval",
-    monitor: "Request volume elevated",
-    condition: "above 2.2× the baseline",
   },
 ] as const;
 
 export type MetricId = (typeof METRICS)[number]["id"];
 export type MetricSpec = (typeof METRICS)[number];
 export type MetricUnit = MetricSpec["unit"];
+export type Sample = Record<MetricId, number>;
+
+export const PRIMARY_METRIC: MetricId = AOV_CENTS;
+export const EXPECTED_LABEL = "promo launch";
 
 export const BASELINE_WINDOW_MS = 5 * 60 * 1000;
 export const BASELINE_WINDOW_LABEL = "5m";
-
-/** Share of category spend that remains when 1st-of-month expenses are missing. */
-export const ANOMALY_SPEND_FACTOR = 0.42;
-export const ANOMALY_ERROR_ADD = 38;
 
 export function isMetricId(value: string): value is MetricId {
   return METRICS.some((metric) => metric.id === value);
@@ -69,7 +93,6 @@ export function round4(value: number): number {
   return Math.round(value * 10_000) / 10_000;
 }
 
-/** 0 at the trough, 1 at the peak. UTC so a laptop timezone does not change the shape. */
 function diurnal(t: number): number {
   const date = new Date(t);
   const hour = date.getUTCHours() + date.getUTCMinutes() / 60;
@@ -77,32 +100,28 @@ function diurnal(t: number): number {
 }
 
 /**
- * Healthy reading for one interval.
- * `rand` should return values in [0, 1). It is called exactly twice.
+ * One interval of healthy FreshCart checkout.
+ * Orders stay at 4 and units at 28, matching the demo basket run.
+ * AOV wobbles around 3483 cents. `rand` is called exactly twice.
  */
-export function healthyValue(metric: MetricId, t: number, rand: () => number): number {
-  const wave = diurnal(t);
+export function sampleHealthy(t: number, rand: () => number): Sample {
   const r1 = rand();
   const r2 = rand();
-  switch (metric) {
-    case "category_spend": {
-      const day = new Date(t).getUTCDate();
-      const base = 22_000 + day * 3_400;
-      const wobble = Math.sin(t / 3_600_000) * 700;
-      return base + wobble + (r1 - 0.5) * 500 + (r2 - 0.5) * 200;
-    }
-    case "budget_calc_errors": {
-      const rare = r1 < 0.06 ? 2 : 0;
-      const extra = r2 < 0.3 ? 1 : 0;
-      return rare + extra;
-    }
-    case "request_latency_p95_ms":
-      return 90 + wave * 55 + r1 * 18 + r2 * 6;
-    case "error_rate":
-      return Math.max(0, 0.003 + wave * 0.003 + (r1 - 0.5) * 0.0015 + (r2 - 0.5) * 0.0008);
-    case "request_count":
-      return Math.round(42 + wave * 34 + r1 * 8 + r2 * 4);
-  }
+  const wave = diurnal(t);
+  const orders = 4;
+  const aov = Math.round(HEALTHY_AOV_CENTS + (r1 - 0.5) * 36 + Math.sin(t / 3_600_000) * 18);
+  return {
+    [ORDERS]: orders,
+    [UNITS]: orders * UNITS_PER_ORDER,
+    [AOV_CENTS]: aov,
+    [GMV_CENTS]: orders * aov,
+    [LATENCY_P95_MS]: 90 + wave * 55 + r2 * 18,
+    [ERROR_RATE]: Math.max(0, 0.003 + wave * 0.003 + (r1 - 0.5) * 0.001),
+  };
+}
+
+export function healthyValue(metric: MetricId, t: number, rand: () => number): number {
+  return sampleHealthy(t, rand)[metric];
 }
 
 export type ModeFlags = {
@@ -111,61 +130,71 @@ export type ModeFlags = {
 };
 
 /**
- * Anomaly: 1st-of-month expenses disappear from spentByCategory, and budget
- * calculation errors jump with them. Expected spike: a feature-flag launch
- * raises traffic and latency without paging.
- * The two modes compose so a demo can show both at once.
+ * Anomaly: multi-quantity lines are charged at the catalog unit price, so GMV
+ * and AOV fall by about 32% (AOV ~2356 cents) while orders and units stay flat.
+ * Expected spike: a promo launch lifts order volume. It is annotated and not paged.
  */
 export function applyMode(metric: MetricId, healthy: number, mode: ModeFlags): number {
   let value = healthy;
-  if (mode.anomaly) {
-    if (metric === "category_spend") value = Math.max(0, healthy * ANOMALY_SPEND_FACTOR);
-    else if (metric === "budget_calc_errors") value = healthy + ANOMALY_ERROR_ADD;
-    else if (metric === "error_rate") value = Math.min(1, healthy + 0.021);
+  if (mode.anomaly && (metric === GMV_CENTS || metric === AOV_CENTS)) {
+    value = Math.round(healthy * ANOMALY_PRICE_FACTOR);
   }
   if (mode.expected) {
-    if (metric === "request_count") value = healthy * 2.7;
-    else if (metric === "request_latency_p95_ms") value = healthy * 1.85;
+    if (metric === ORDERS || metric === UNITS || metric === GMV_CENTS) value = Math.round(value * PROMO_LIFT);
+    else if (metric === LATENCY_P95_MS) value = healthy * 1.45;
   }
   return value;
+}
+
+export function applySample(sample: Sample, mode: ModeFlags): Sample {
+  const next = { ...sample };
+  for (const spec of METRICS) {
+    next[spec.id] = applyMode(spec.id, sample[spec.id], mode);
+  }
+  return next;
 }
 
 export type MonitorStatus = "ok" | "warn" | "alert";
 
 export function monitorStatus(metric: MetricId, latest: number, baseline: number, mode: ModeFlags): MonitorStatus {
   switch (metric) {
-    case "category_spend":
+    case GMV_CENTS:
+    case AOV_CENTS:
       if (mode.anomaly) return "alert";
-      if (baseline > 0 && latest < baseline * 0.7) return "alert";
+      if (baseline > 0 && latest < baseline * 0.8) return "alert";
       return "ok";
-    case "budget_calc_errors":
-      if (latest >= 20) return "alert";
-      if (latest >= 8) return "warn";
+    case ORDERS:
+    case UNITS:
+      if (mode.expected) return "warn";
+      if (baseline > 0 && latest > baseline * 2.2) return "warn";
       return "ok";
-    case "error_rate":
+    case ERROR_RATE:
       if (latest >= 0.05) return "alert";
       if (latest >= 0.02) return "warn";
       return "ok";
-    case "request_latency_p95_ms":
+    case LATENCY_P95_MS:
       if (latest >= 400) return "alert";
-      if (latest >= 200 || mode.expected) return "warn";
-      return "ok";
-    case "request_count":
-      if (mode.expected) return "warn";
-      if (baseline > 0 && latest > baseline * 2.2) return "warn";
+      if (latest >= 220 || mode.expected) return "warn";
       return "ok";
   }
 }
 
 export function formatMetric(metric: string, value: number): string {
   const spec = metricById(metric);
-  const rounded = Math.round(value);
-  const grouped = groupInteger(rounded);
+  if (spec?.unit === "cents") return formatCents(value);
+  const grouped = groupInteger(Math.round(value));
   if (!spec) return grouped;
-  if (spec.unit === "usd") return `$${grouped}`;
   if (spec.unit === "ms") return `${grouped} ms`;
   if (spec.unit === "ratio") return `${(value * 100).toFixed(2)}%`;
   return grouped;
+}
+
+function formatCents(cents: number): string {
+  const sign = cents < 0 ? "-" : "";
+  const abs = Math.abs(Math.round(cents));
+  const dollars = Math.floor(abs / 100);
+  const frac = (abs % 100).toString().padStart(2, "0");
+  return `${sign}$${groupInteger(dollars)}.${frac}`;
 }
 
 function groupInteger(value: number): string {

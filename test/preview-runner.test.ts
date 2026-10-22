@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { AOV_CENTS, ORDERS } from "../src/metrics.ts";
 import { buildIngestBody, parseArgs, previewEnv } from "../scripts/preview-runner.ts";
 import { startTestServer } from "./helpers.ts";
 
@@ -44,11 +45,11 @@ test("parseArgs requires a numeric PR and a mode", () => {
 test("a simulated sample is healthy and addressed to preview-<pr>", () => {
   const body = buildIngestBody("8", Date.UTC(2026, 9, 22, 12, 0, 0));
   assert.equal(body.env, "preview-8");
-  assert.equal(body.points.length, 5);
-  const spend = body.points.find((point) => point.metric === "category_spend");
-  const errors = body.points.find((point) => point.metric === "budget_calc_errors");
-  assert.ok(spend && spend.v > 50_000);
-  assert.ok(errors && errors.v < 8);
+  const aov = body.points.find((point) => point.metric === AOV_CENTS);
+  const orders = body.points.find((point) => point.metric === ORDERS);
+  assert.ok(aov && Math.abs(aov.v - 3483) < 40);
+  assert.equal(orders?.v, 4);
+  assert.equal(body.points.length, 6);
 });
 
 test("help and a non-Next repo exit with a useful status", { timeout: 20_000 }, async () => {
@@ -63,7 +64,7 @@ test("help and a non-Next repo exit with a useful status", { timeout: 20_000 }, 
   );
   const failed = await run(["--pr", "4", "--repo", dir]);
   assert.notEqual(failed.code, 0);
-  assert.match(failed.stderr, /next/i);
+  assert.match(failed.stderr, /freshcart|demo-checkout-metrics/i);
 });
 
 test("simulate --once reports preview-<pr> to datacat", { timeout: 20_000 }, async () => {
@@ -72,11 +73,11 @@ test("simulate --once reports preview-<pr> to datacat", { timeout: 20_000 }, asy
     const result = await run(["--pr", "128", "--simulate", "--once", "--datacat", started.url]);
     assert.equal(result.code, 0, result.stderr);
     const response = await fetch(
-      `${started.url}/api/query?metric=category_spend&env=preview-128&from=0&to=${Date.now() + 60_000}`,
+      `${started.url}/api/query?metric=${encodeURIComponent(AOV_CENTS)}&env=preview-128&from=0&to=${Date.now() + 60_000}`,
     );
     const body = (await response.json()) as { points: Array<{ v: number }> };
     assert.ok(body.points.length >= 1);
-    assert.ok((body.points.at(-1)?.v ?? 0) > 50_000);
+    assert.ok(Math.abs((body.points.at(-1)?.v ?? 0) - 3483) < 80);
   } finally {
     await started.close();
   }

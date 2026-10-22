@@ -3,15 +3,19 @@ import { DEFAULT_CONFIG, normalizeBotAlias } from "./config.ts";
 import {
   BASELINE_WINDOW_LABEL,
   BASELINE_WINDOW_MS,
+  EXPECTED_LABEL,
   METRICS,
+  ORDERS,
+  PRIMARY_METRIC,
   applyMode,
+  applySample,
   assertEnvName,
   formatMetric,
   healthyValue,
   isMetricId,
-  metricById,
   monitorStatus,
   round4,
+  sampleHealthy,
   type MetricId,
   type MonitorStatus,
   type ModeFlags,
@@ -291,7 +295,7 @@ export class DatacatApp {
     return { env, accepted: points.length };
   }
 
-  triggerAnomaly(env = "prod", metric = "category_spend"): { incident: Incident; created: boolean } {
+  triggerAnomaly(env = "prod", metric: string = PRIMARY_METRIC): { incident: Incident; created: boolean } {
     assertEnvName(env);
     const metricId = this.requireMetric(metric);
     const existing = this.incidents.find(
@@ -323,7 +327,7 @@ export class DatacatApp {
       window: BASELINE_WINDOW_LABEL,
       status: "alert",
       openedAt: now,
-      summary: "1st-of-month expenses dropped from spentByCategory",
+      summary: "Checkout undercharged multi-quantity lines",
       delivery: { status: "pending", attempts: 0 },
     };
     this.incidents.push(incident);
@@ -332,16 +336,16 @@ export class DatacatApp {
       level: "alert",
       env,
       incidentId: incident.id,
-      label: "drop",
+      label: "undercharge",
       t: start,
-      message: `Anomaly injected on ${env}: 1st-of-month expenses dropped from spentByCategory. ${metricId} is ${formatMetric(metricId, value)} vs baseline ${formatMetric(metricId, incident.baseline)} over ${BASELINE_WINDOW_LABEL}. budget_calc_errors spiked in correlation.`,
+      message: `Anomaly injected on ${env}: checkout undercharged multi-quantity lines. ${metricId} is ${formatMetric(metricId, value)} vs baseline ${formatMetric(metricId, incident.baseline)} over ${BASELINE_WINDOW_LABEL}. GMV fell with AOV; orders and units stayed flat.`,
     });
     return { incident, created: true };
   }
 
-  triggerExpectedSpike(env = "prod", label = "feature flag launch"): { env: string; label: string; active: true } {
+  triggerExpectedSpike(env = "prod", label: string = EXPECTED_LABEL): { env: string; label: string; active: true } {
     assertEnvName(env);
-    const text = label.trim().slice(0, 80) || "feature flag launch";
+    const text = label.trim().slice(0, 80) || EXPECTED_LABEL;
     this.ensureHistory(env);
     const now = this.now();
     const mode = this.modeOf(env);
@@ -354,9 +358,9 @@ export class DatacatApp {
       kind: "expected_spike",
       level: "warn",
       env,
-      label: "feature flag",
+      label: "promo",
       t: mode.expectedAt,
-      message: `Expected spike on ${env}: ${text}. request_count and latency are elevated. Annotated, not paged.`,
+      message: `Expected spike on ${env}: ${text}. Orders and units are elevated. Annotated, not paged.`,
     });
     return { env, label: text, active: true };
   }
@@ -758,39 +762,38 @@ export class DatacatApp {
   }
 
   private ensureHistory(env: string): void {
-    if (this.store.latest(env, "category_spend")) return;
+    if (this.store.latest(env, ORDERS)) return;
     const hours = this.config.historyHours > 0 ? Math.min(this.config.historyHours, 6) : 2;
     this.backfill(env, hours);
   }
 
+  private basket(env: string, t: number, transform: boolean) {
+    const healthy = sampleHealthy(t, randAt(env, "basket", t));
+    return transform ? applySample(healthy, this.modeOf(env)) : healthy;
+  }
+
   private writeSamples(env: string, t: number, transform: boolean): void {
-    const mode = this.modeOf(env);
+    const values = this.basket(env, t, transform);
     for (const spec of METRICS) {
-      const healthy = healthyValue(spec.id, t, randAt(env, spec.id, t));
-      const value = transform ? applyMode(spec.id, healthy, mode) : healthy;
-      this.store.append(env, spec.id, t, round4(value));
+      this.store.append(env, spec.id, t, round4(values[spec.id]));
     }
     const previous = this.lastT.get(env) ?? 0;
     if (t > previous) this.lastT.set(env, t);
   }
 
-  /** Recompute stored samples in [start, now] from the deterministic baseline and the current mode. */
+  /** Recompute stored samples in [start, now] from the deterministic basket and the current mode. */
   private rewriteRange(env: string, start: number, now: number): void {
-    const mode = this.modeOf(env);
-    let replaced = false;
-    for (const spec of METRICS) {
-      const existing = this.store.query(env, spec.id, start, now);
-      for (const point of existing) {
-        replaced = true;
-        const healthy = healthyValue(spec.id, point.t, randAt(env, spec.id, point.t));
-        const value = mode.anomaly || mode.expected ? applyMode(spec.id, healthy, mode) : healthy;
-        this.store.append(env, spec.id, point.t, round4(value));
-      }
-    }
-    if (!replaced) {
+    const existing = this.store.query(env, ORDERS, start, now);
+    if (existing.length === 0) {
       const step = this.config.generatorIntervalMs;
       for (let t = start; t <= now; t += step) this.writeSamples(env, t, true);
       return;
+    }
+    for (const point of existing) {
+      const values = this.basket(env, point.t, true);
+      for (const spec of METRICS) {
+        this.store.append(env, spec.id, point.t, round4(values[spec.id]));
+      }
     }
     const latest = this.lastT.get(env) ?? 0;
     if (latest < now) this.writeSamples(env, now, true);
@@ -873,5 +876,5 @@ export function isRangeKey(value: string): value is RangeKey {
 }
 
 export function metricKnown(id: string): boolean {
-  return metricById(id) !== undefined;
+  return isMetricId(id);
 }

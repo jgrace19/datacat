@@ -2,51 +2,61 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHmac } from "node:crypto";
 import {
-  ANOMALY_ERROR_ADD,
-  ANOMALY_SPEND_FACTOR,
-  applyMode,
-  healthyValue,
+  ANOMALY_AOV_CENTS,
+  ANOMALY_PRICE_FACTOR,
+  AOV_CENTS,
+  ERROR_RATE,
+  GMV_CENTS,
+  HEALTHY_AOV_CENTS,
+  LATENCY_P95_MS,
+  ORDERS,
+  UNITS,
+  applySample,
   monitorStatus,
+  sampleHealthy,
 } from "../src/metrics.ts";
 import { signBody } from "../src/sign.ts";
 
 const half = () => 0.5;
 const now = Date.UTC(2026, 9, 22, 16, 0, 0);
 
-test("healthy budgetsphere series stay inside the ok band", () => {
-  const spend = healthyValue("category_spend", now, half);
-  const errors = healthyValue("budget_calc_errors", now, half);
-  const latency = healthyValue("request_latency_p95_ms", now, half);
-  const errorRate = healthyValue("error_rate", now, half);
-  const count = healthyValue("request_count", now, half);
-  assert.ok(spend > 50_000 && spend < 150_000, String(spend));
-  assert.ok(errors >= 0 && errors < 8);
-  assert.ok(latency > 80 && latency < 200);
-  assert.ok(errorRate >= 0 && errorRate < 0.02);
-  assert.ok(count > 20 && count < 120);
-  assert.equal(monitorStatus("category_spend", spend, spend, { anomaly: false, expected: false }), "ok");
-  assert.equal(monitorStatus("budget_calc_errors", errors, errors, { anomaly: false, expected: false }), "ok");
+test("healthy freshcart checkout matches the GreenMart basket", () => {
+  const sample = sampleHealthy(now, half);
+  assert.equal(sample[ORDERS], 4);
+  assert.equal(sample[UNITS], 28);
+  assert.ok(Math.abs(sample[AOV_CENTS] - HEALTHY_AOV_CENTS) < 40);
+  assert.equal(sample[GMV_CENTS], sample[ORDERS] * sample[AOV_CENTS]);
+  assert.ok(sample[LATENCY_P95_MS] > 80 && sample[LATENCY_P95_MS] < 200);
+  assert.ok(sample[ERROR_RATE] >= 0 && sample[ERROR_RATE] < 0.02);
+  const calm = { anomaly: false, expected: false };
+  assert.equal(monitorStatus(AOV_CENTS, sample[AOV_CENTS], sample[AOV_CENTS], calm), "ok");
+  assert.equal(monitorStatus(ORDERS, sample[ORDERS], sample[ORDERS], calm), "ok");
 });
 
-test("anomaly drops category spend and spikes calc errors; expected spike raises traffic", () => {
-  const spend = healthyValue("category_spend", now, half);
-  const errors = healthyValue("budget_calc_errors", now, half);
-  const dropped = applyMode("category_spend", spend, { anomaly: true, expected: false });
-  const spiked = applyMode("budget_calc_errors", errors, { anomaly: true, expected: false });
-  assert.equal(dropped, spend * ANOMALY_SPEND_FACTOR);
-  assert.ok(dropped < spend * 0.6);
-  assert.equal(spiked, errors + ANOMALY_ERROR_ADD);
-  assert.equal(monitorStatus("category_spend", dropped, spend, { anomaly: true, expected: false }), "alert");
-  assert.equal(monitorStatus("budget_calc_errors", spiked, errors, { anomaly: true, expected: false }), "alert");
+test("anomaly drops GMV and AOV about 32% and a promo lifts volume only", () => {
+  const healthy = sampleHealthy(now, half);
+  const anomaly = applySample(healthy, { anomaly: true, expected: false });
+  assert.equal(anomaly[ORDERS], healthy[ORDERS]);
+  assert.equal(anomaly[UNITS], healthy[UNITS]);
+  assert.equal(anomaly[AOV_CENTS], Math.round(healthy[AOV_CENTS] * ANOMALY_PRICE_FACTOR));
+  assert.equal(anomaly[GMV_CENTS], Math.round(healthy[GMV_CENTS] * ANOMALY_PRICE_FACTOR));
+  assert.ok(Math.abs(anomaly[AOV_CENTS] - ANOMALY_AOV_CENTS) < 40);
+  assert.ok(anomaly[AOV_CENTS] < healthy[AOV_CENTS] * 0.75);
+  const flags = { anomaly: true, expected: false };
+  assert.equal(monitorStatus(AOV_CENTS, anomaly[AOV_CENTS], healthy[AOV_CENTS], flags), "alert");
+  assert.equal(monitorStatus(GMV_CENTS, anomaly[GMV_CENTS], healthy[GMV_CENTS], flags), "alert");
+  assert.equal(monitorStatus(ORDERS, anomaly[ORDERS], healthy[ORDERS], flags), "ok");
 
-  const count = healthyValue("request_count", now, half);
-  const latency = healthyValue("request_latency_p95_ms", now, half);
-  const busy = applyMode("request_count", count, { anomaly: false, expected: true });
-  const slower = applyMode("request_latency_p95_ms", latency, { anomaly: false, expected: true });
-  assert.ok(busy > count * 2);
-  assert.ok(slower > latency * 1.5);
-  assert.equal(monitorStatus("request_count", busy, count, { anomaly: false, expected: true }), "warn");
-  assert.equal(monitorStatus("request_latency_p95_ms", slower, latency, { anomaly: false, expected: true }), "warn");
+  const promo = applySample(healthy, { anomaly: false, expected: true });
+  assert.equal(promo[ORDERS], 10);
+  assert.equal(promo[UNITS], 67);
+  assert.equal(promo[AOV_CENTS], healthy[AOV_CENTS]);
+  assert.ok(promo[GMV_CENTS] > healthy[GMV_CENTS] * 2);
+  assert.ok(promo[LATENCY_P95_MS] > healthy[LATENCY_P95_MS]);
+  const expected = { anomaly: false, expected: true };
+  assert.equal(monitorStatus(ORDERS, promo[ORDERS], healthy[ORDERS], expected), "warn");
+  assert.equal(monitorStatus(LATENCY_P95_MS, promo[LATENCY_P95_MS], healthy[LATENCY_P95_MS], expected), "warn");
+  assert.equal(monitorStatus(AOV_CENTS, promo[AOV_CENTS], healthy[AOV_CENTS], expected), "ok");
 });
 
 test("signBody is sha256 of the raw body", () => {
