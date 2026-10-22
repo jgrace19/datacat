@@ -12,6 +12,7 @@ export async function startTestServer(options: CreateAppOptions = {}) {
       metricsPushIntervalMs: 15_000,
       botAlias: "",
       agentAliasToken: "",
+      observabilitySharedSecret: "",
       webhookSecret: "",
       hmacHeader: "X-Datacat-Signature",
       port: 0,

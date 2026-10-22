@@ -71,11 +71,14 @@ Headers:
 | `Content-Type: application/json` | always |
 | `X-BDK-Session-Key: incident:<incidentId>` | always |
 | `X-Agent-Alias-Token` | `AGENT_ALIAS_TOKEN` is non-empty |
-| `X-Datacat-Signature: sha256=<hex>` | `DATACAT_WEBHOOK_SECRET` is non-empty. The header name is `DATACAT_HMAC_HEADER`. The hex is HMAC-SHA256 of the raw body. |
+| `X-Observability-Token` | `OBSERVABILITY_SHARED_SECRET` is non-empty. This is the shared secret `jgrace19/spike-detector` checks on `/alert` and `/metrics`. |
+| `X-Datacat-Signature: sha256=<hex>` | Off unless `DATACAT_WEBHOOK_SECRET` is set. The header name is `DATACAT_HMAC_HEADER`. The hex is HMAC-SHA256 of the raw body. |
+
+HMAC is off by default. Hosted bots reject `X-BDK-Session-Key` when the request is also HMAC-signed, so leave `DATACAT_WEBHOOK_SECRET` empty for spike-detector and send `X-Observability-Token` instead. The same headers are used for snapshot push, with `X-BDK-Session-Key: metrics:snapshot`.
 
 A 2xx is stored as delivered and is not sent again for that `incidentId`. Non-2xx responses retry up to 8 times with the same id. Treat `incidentId` as the idempotency key. The incident row in the UI keeps the status code and response body.
 
-Verify a signature with the raw body, not a re-serialized object:
+If you do turn HMAC on, verify it with the raw body, not a re-serialized object:
 
 ```js
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -91,7 +94,7 @@ function verified(secret, rawBody, header) {
 
 When snapshot push is on, datacat POSTs to `$BOT_ALIAS/v1/channels/observability/metrics` on `METRICS_PUSH_INTERVAL_MS` (minimum 2000). The dashboard toggle overrides the enabled flag until restart. **Push now** sends one snapshot even if the toggle is off.
 
-The JSON body is `{ sentAt, snapshots, openIncidents }`. Each snapshot has `env`, `metric`, `unit`, `latest`, `baseline`, `status`, and up to 30 points from the last 5 minutes. Auth headers match the alert, with `X-BDK-Session-Key: metrics:snapshot`.
+The JSON body is `{ sentAt, snapshots, openIncidents }`. Each snapshot has `env`, `metric`, `unit`, `latest`, `baseline`, `status`, and up to 30 points from the last 5 minutes. Auth headers match the alert, including `X-Observability-Token` when `OBSERVABILITY_SHARED_SECRET` is set, with `X-BDK-Session-Key: metrics:snapshot`.
 
 ## HTTP API
 
@@ -103,7 +106,7 @@ The JSON body is `{ sentAt, snapshots, openIncidents }`. Each snapshot has `env`
 | `POST` | `/api/resolve` | `{ "env": "prod", "incidentId": "optional" }`. Clears anomaly mode and an expected spike for that env. |
 | `POST` | `/api/expected-spike` | `{ "env": "prod", "label": "feature flag launch" }`. Does not page. |
 | `GET` | `/api/dashboard?env&range` | `range` is `15m`, `1h`, `4h`, or `1d`. |
-| `POST` | `/api/settings` | `{ "botAlias", "pushEnabled", "pushIntervalMs" }`. Token and HMAC secret stay in the environment. |
+| `POST` | `/api/settings` | `{ "botAlias", "pushEnabled", "pushIntervalMs" }`. The alias token, observability secret, and HMAC secret stay in the environment. |
 | `POST` | `/api/push-now` | Send one snapshot. |
 | `POST` | `/api/incidents/:id/redeliver` | Retry a delivery that has not succeeded. |
 

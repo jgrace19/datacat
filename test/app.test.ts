@@ -4,13 +4,14 @@ import { DatacatApp } from "../src/app.ts";
 import { signBody } from "../src/sign.ts";
 import { startMockBot } from "./helpers.ts";
 
-function appWith(bot?: { url: string; token?: string; secret?: string }) {
+function appWith(bot?: { url: string; token?: string; secret?: string; observability?: string }) {
   return new DatacatApp({
     config: {
       historyHours: 0,
       generatorIntervalMs: 60_000,
       botAlias: bot?.url ?? "",
       agentAliasToken: bot?.token ?? "",
+      observabilitySharedSecret: bot?.observability ?? "",
       webhookSecret: bot?.secret ?? "",
       hmacHeader: "X-Datacat-Signature",
       metricsPushEnabled: false,
@@ -120,22 +121,29 @@ test("ingest is rejected for prod and transformed while a preview anomaly is ope
   assert.ok(Math.abs(latest.v - 42_000) < 1);
 });
 
-test("metrics push posts a snapshot and omits the HMAC header when no secret is set", async () => {
+test("alert and metrics send the observability token and leave HMAC off by default", async () => {
   const bot = await startMockBot();
-  const app = appWith({ url: bot.url, token: "alias-token" });
+  const app = appWith({ url: bot.url, token: "alias-token", observability: "shared-secret" });
   try {
-    app.backfill("prod", 1);
-    const result = await app.pushMetricsOnce({ force: true });
-    assert.equal(result.status, "delivered");
-    assert.equal(bot.requests.length, 1);
-    const posted = bot.requests[0];
-    assert.ok(posted);
-    assert.equal(posted.url, "/v1/channels/observability/metrics");
-    assert.equal(posted.headers["x-bdk-session-key"], "metrics:snapshot");
-    assert.equal(posted.headers["x-agent-alias-token"], "alias-token");
-    assert.equal(posted.headers["x-datacat-signature"], undefined);
-    const body = JSON.parse(posted.body) as { snapshots: Array<{ env: string; metric: string }> };
-    assert.ok(body.snapshots.some((row) => row.env === "prod" && row.metric === "category_spend"));
+    const { incident } = app.triggerAnomaly("prod");
+    await app.flushAlerts();
+    const alert = bot.requests[0];
+    assert.ok(alert);
+    assert.equal(alert.url, "/v1/channels/observability/alert");
+    assert.equal(alert.headers["x-observability-token"], "shared-secret");
+    assert.equal(alert.headers["x-agent-alias-token"], "alias-token");
+    assert.equal(alert.headers["x-bdk-session-key"], `incident:${incident.id}`);
+    assert.equal(alert.headers["x-datacat-signature"], undefined);
+
+    app.backfill("preview-7", 1);
+    await app.pushMetricsOnce({ force: true });
+    const metrics = bot.requests[1];
+    assert.ok(metrics);
+    assert.equal(metrics.url, "/v1/channels/observability/metrics");
+    assert.equal(metrics.headers["x-observability-token"], "shared-secret");
+    assert.equal(metrics.headers["x-agent-alias-token"], "alias-token");
+    assert.equal(metrics.headers["x-bdk-session-key"], "metrics:snapshot");
+    assert.equal(metrics.headers["x-datacat-signature"], undefined);
   } finally {
     await bot.close();
   }

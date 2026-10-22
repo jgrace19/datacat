@@ -534,6 +534,7 @@ export class DatacatApp {
     return {
       botAlias: this.botAlias,
       tokenConfigured: this.config.agentAliasToken.length > 0,
+      observabilityTokenConfigured: this.config.observabilitySharedSecret.length > 0,
       hmacConfigured: this.config.webhookSecret.length > 0,
       hmacHeader: this.config.hmacHeader,
       pushEnabled: this.pushEnabled,
@@ -697,6 +698,11 @@ export class DatacatApp {
       "X-BDK-Session-Key": sessionKey,
     };
     if (this.config.agentAliasToken) headers["X-Agent-Alias-Token"] = this.config.agentAliasToken;
+    if (this.config.observabilitySharedSecret) {
+      headers["X-Observability-Token"] = this.config.observabilitySharedSecret;
+    }
+    // HMAC stays off unless DATACAT_WEBHOOK_SECRET is set. Hosted bots reject
+    // X-BDK-Session-Key when the body is also signed, so the default is no signature.
     if (this.config.webhookSecret) headers[this.config.hmacHeader] = signBody(this.config.webhookSecret, body);
     return headers;
   }

@@ -10,13 +10,21 @@ test("config reads defaults and overrides", () => {
     PORT: "9000",
     BOT_ALIAS: "http://bot.example/base/",
     METRICS_PUSH_ENABLED: "yes",
+    OBSERVABILITY_SHARED_SECRET: "shared",
     DATACAT_WEBHOOK_SECRET: "s3cret",
   });
   assert.equal(config.port, 9000);
   assert.equal(config.botAlias, "http://bot.example/base");
   assert.equal(config.metricsPushEnabled, true);
+  assert.equal(config.observabilitySharedSecret, "shared");
   assert.equal(config.webhookSecret, "s3cret");
   assert.equal(config.hmacHeader, "X-Datacat-Signature");
+});
+
+test("HMAC and the observability token are empty unless set", () => {
+  const config = configFromEnv({});
+  assert.equal(config.observabilitySharedSecret, "");
+  assert.equal(config.webhookSecret, "");
 });
 
 test("config rejects a bad boolean and an oversized history", () => {

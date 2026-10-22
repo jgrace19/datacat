@@ -408,11 +408,12 @@ function settingsHtml(data) {
       </div>
       <div class="kv">
         <div><b>Alias token</b>${settings.tokenConfigured ? "Configured" : "Not set"}</div>
+        <div><b>Observability token</b>${settings.observabilityTokenConfigured ? "Configured" : "Not set"}</div>
         <div><b>HMAC</b>${settings.hmacConfigured ? esc(settings.hmacHeader) : "Off"}</div>
         <div><b>Last push</b>${esc(last.status)}${last.statusCode ? " · HTTP " + esc(last.statusCode) : ""}${last.error ? " · " + esc(last.error) : ""}</div>
       </div>
       ${last.responseBody ? `<pre class="response">${esc(last.responseBody)}</pre>` : ""}
-      <p class="help">The alias token and HMAC secret stay in the environment. They are not shown here and cannot be changed from the browser.</p>
+      <p class="help">The alias token, observability shared secret, and HMAC secret stay in the environment. They are not shown here. HMAC is off unless a webhook secret is set.</p>
     </form>`;
 }
 

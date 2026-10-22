@@ -6,6 +6,7 @@ export type Config = {
   host: string;
   botAlias: string;
   agentAliasToken: string;
+  observabilitySharedSecret: string;
   webhookSecret: string;
   hmacHeader: string;
   metricsPushEnabled: boolean;
@@ -19,6 +20,7 @@ export const DEFAULT_CONFIG: Config = {
   host: "127.0.0.1",
   botAlias: "",
   agentAliasToken: "",
+  observabilitySharedSecret: "",
   webhookSecret: "",
   hmacHeader: "X-Datacat-Signature",
   metricsPushEnabled: false,
@@ -92,6 +94,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     host: (env.HOST ?? DEFAULT_CONFIG.host).trim() || DEFAULT_CONFIG.host,
     botAlias: normalizeBotAlias(env.BOT_ALIAS ?? ""),
     agentAliasToken: env.AGENT_ALIAS_TOKEN ?? "",
+    observabilitySharedSecret: env.OBSERVABILITY_SHARED_SECRET ?? "",
     webhookSecret: env.DATACAT_WEBHOOK_SECRET ?? "",
     hmacHeader: header,
     metricsPushEnabled: boolEnv(env, "METRICS_PUSH_ENABLED", DEFAULT_CONFIG.metricsPushEnabled),
