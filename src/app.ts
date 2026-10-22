@@ -327,7 +327,7 @@ export class DatacatApp {
       window: BASELINE_WINDOW_LABEL,
       status: "alert",
       openedAt: now,
-      summary: "Checkout undercharged multi-quantity lines",
+      summary: "GMV and AOV below baseline",
       delivery: { status: "pending", attempts: 0 },
     };
     this.incidents.push(incident);
@@ -336,9 +336,9 @@ export class DatacatApp {
       level: "alert",
       env,
       incidentId: incident.id,
-      label: "undercharge",
+      label: "anomaly",
       t: start,
-      message: `Anomaly injected on ${env}: checkout undercharged multi-quantity lines. ${metricId} is ${formatMetric(metricId, value)} vs baseline ${formatMetric(metricId, incident.baseline)} over ${BASELINE_WINDOW_LABEL}. GMV fell with AOV; orders and units stayed flat.`,
+      message: `Anomaly detected on ${env}: ${metricId} is ${formatMetric(metricId, value)} vs baseline ${formatMetric(metricId, incident.baseline)} over ${BASELINE_WINDOW_LABEL}. GMV fell with AOV; orders and units stayed flat.`,
     });
     return { incident, created: true };
   }

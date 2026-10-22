@@ -23,7 +23,7 @@ The process binds to `127.0.0.1`. A hosted bot cannot dial this laptop; datacat 
 ## Demo
 
 1. Leave the dashboard on `$env = prod` and **Past 1 Hour**. Category spend, budget-calc errors, latency, error rate, and request count should sit in the healthy band. Monitor pills read **OK**.
-2. Click **Trigger anomaly**. GMV and average order value drop about 32% (AOV from about $34.83 to about $23.56) because multi-quantity lines are charged at the catalog unit price only. Orders stay at 4 and units stay at 28. A red banner names the incident. The incident row shows delivery:
+2. Click **Trigger anomaly**. GMV and average order value drop about 32% (AOV from about $34.83 to about $23.56). Orders stay at 4 and units stay at 28. A red banner names the incident. The incident row shows delivery:
    - **SKIPPED** when `BOT_ALIAS` is empty
    - **DELIVERED** with the HTTP status and response body when the bot accepts it
    - **FAILED** with the error, and a **Retry** control

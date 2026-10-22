@@ -28,7 +28,7 @@ test("anomaly drops spend, pages once, and resolve restores baseline", async () 
     assert.equal(first.created, true);
     assert.equal(first.incident.window, "5m");
     assert.equal(first.incident.metric, AOV_CENTS);
-    assert.match(first.incident.summary, /multi-quantity/);
+    assert.match(first.incident.summary, /below baseline/);
     assert.ok(first.incident.value < first.incident.baseline * 0.75);
     assert.ok(first.incident.value > first.incident.baseline * 0.6);
     const orders = app.store.latest("prod", ORDERS);
