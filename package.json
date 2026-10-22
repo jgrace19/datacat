@@ -1,0 +1,22 @@
+{
+  "name": "datacat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local mock observability platform for a Cursor BDK anomaly-triage demo",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "test": "tsx --test test/config.test.ts test/store.test.ts test/metrics.test.ts test/app.test.ts test/api.test.ts test/preview-runner.test.ts",
+    "typecheck": "tsc --noEmit",
+    "preview": "tsx scripts/preview-runner.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
