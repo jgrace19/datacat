@@ -9,7 +9,7 @@ export const TUNNEL_URL_FILE = ".tunnel-url";
 
 /** First public https URL once the following character shows the token is complete. */
 export function findTunnelUrl(text: string): string | undefined {
-  const match = text.match(/https:\/\/[^\s"'<>|]+(?=[\s|])/);
+  const match = text.match(/https:\/\/[a-z0-9-]+\.(?:trycloudflare\.com|loca\.lt)/);
   if (!match) return undefined;
   return match[0].replace(/[),.;]+$/, "");
 }
