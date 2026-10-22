@@ -219,6 +219,17 @@ function renderBanner(data) {
       </div>`;
     return;
   }
+  if (data.mode.recovery) {
+    host.innerHTML = `
+      <div class="banner deploy" role="status">
+        <span class="status ok">DEPLOY</span>
+        <div class="banner-copy">
+          <strong>Deploy: PR #${esc(data.mode.recovery.pr)}</strong>
+          <div>GMV and average order value on ${esc(data.env)} are returning to baseline.</div>
+        </div>
+      </div>`;
+    return;
+  }
   host.innerHTML = "";
 }
 
@@ -374,10 +385,10 @@ function responseText(incident) {
 }
 
 function eventsHtml(data, full) {
-  const filters = ["all", "anomaly", "expected_spike", "alert", "resolve", "ingest", "push"];
+  const filters = ["all", "anomaly", "expected_spike", "deploy", "alert", "resolve", "ingest", "push"];
   const events = data.events.filter((event) => state.eventFilter === "all" || event.kind === state.eventFilter);
   return `
-    ${full ? `<div class="page-head"><div><h1>Events</h1><p class="sub">Anomaly, expected spike, delivery, ingest, and snapshot push.</p></div></div>` : ""}
+    ${full ? `<div class="page-head"><div><h1>Events</h1><p class="sub">Anomaly, deploy, delivery, ingest, and snapshot push.</p></div></div>` : ""}
     <div class="filters">
       ${filters.map((filter) => `<button class="chip ${state.eventFilter === filter ? "on" : ""}" type="button" data-action="filter" data-filter="${filter}">${esc(filter.replace("_", " "))}</button>`).join("")}
     </div>
@@ -503,7 +514,7 @@ function drawChart(node, metric, data) {
     if (!markAffects(mark.kind, metric.id)) return "";
     if (mark.t < from || mark.t > to) return "";
     const px = x(mark.t);
-    const color = mark.kind === "anomaly" ? "#d32f2f" : mark.kind === "expected_spike" ? "#e6a100" : "#2f9e44";
+    const color = mark.kind === "anomaly" ? "#d32f2f" : mark.kind === "expected_spike" ? "#e6a100" : mark.kind === "deploy" ? "#6d4bd1" : "#2f9e44";
     return `<line x1="${px}" x2="${px}" y1="${pad.t}" y2="${height - pad.b}" stroke="${color}" stroke-dasharray="3 3" stroke-width="1"/>
       <text x="${px + 3}" y="${pad.t + 10}" fill="${color}" font-size="10">${esc(mark.label || "")}</text>`;
   }).join("");
@@ -567,6 +578,7 @@ function markAffects(kind, metricId) {
     "freshcart.checkout.gmv_cents",
     "freshcart.http.latency_p95_ms",
   ];
+  if (kind === "deploy") return true;
   if (kind === "anomaly" || kind === "resolve") return money.includes(metricId);
   if (kind === "expected_spike") return promo.includes(metricId);
   return false;

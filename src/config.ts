@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 export type Config = {
@@ -13,6 +14,28 @@ export type Config = {
   metricsPushIntervalMs: number;
   generatorIntervalMs: number;
   historyHours: number;
+};
+
+export type ShipConfig = {
+  enabled: boolean;
+  intervalMs: number;
+  repo: string;
+  base: string;
+  label: string;
+  marketplaceDir: string;
+  backendPort: number;
+  recoveryMs: number;
+};
+
+export const DEFAULT_SHIP: ShipConfig = {
+  enabled: true,
+  intervalMs: 5_000,
+  repo: "jgrace19/marketplace",
+  base: "demo/base",
+  label: "ship",
+  marketplaceDir: path.join(homedir(), "cursor-dev", "marketplace"),
+  backendPort: 8010,
+  recoveryMs: 25_000,
 };
 
 export const DEFAULT_CONFIG: Config = {
@@ -82,6 +105,31 @@ export function normalizeBotAlias(raw: string): string {
     throw new Error("BOT_ALIAS must be http or https");
   }
   return url.toString().replace(/\/+$/, "");
+}
+
+function expandHome(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/")) return path.join(homedir(), value.slice(2));
+  return value;
+}
+
+export function shipConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ShipConfig {
+  const backendPort = intEnv(env, "MARKETPLACE_BACKEND_PORT", DEFAULT_SHIP.backendPort, 1, 65535);
+  if (backendPort === 8000) throw new Error("MARKETPLACE_BACKEND_PORT must not be 8000");
+  const dirRaw = (env.MARKETPLACE_DIR ?? "").trim();
+  const repo = (env.SHIP_REPO ?? DEFAULT_SHIP.repo).trim() || DEFAULT_SHIP.repo;
+  const base = (env.SHIP_BASE ?? DEFAULT_SHIP.base).trim() || DEFAULT_SHIP.base;
+  const label = (env.SHIP_LABEL ?? DEFAULT_SHIP.label).trim() || DEFAULT_SHIP.label;
+  return {
+    enabled: boolEnv(env, "SHIP_WATCH_ENABLED", DEFAULT_SHIP.enabled),
+    intervalMs: intEnv(env, "SHIP_WATCH_INTERVAL_MS", DEFAULT_SHIP.intervalMs, 1000),
+    repo,
+    base,
+    label,
+    marketplaceDir: dirRaw ? expandHome(dirRaw) : DEFAULT_SHIP.marketplaceDir,
+    backendPort,
+    recoveryMs: intEnv(env, "RECOVERY_MS", DEFAULT_SHIP.recoveryMs, 1000, 120_000),
+  };
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {

@@ -315,6 +315,8 @@ button { cursor: pointer; }
 
 .banner.expected { background: #8a5b00; }
 
+.banner.deploy { background: #4c3296; }
+
 .banner-copy { flex: 1; min-width: 0; }
 
 .banner-copy strong { display: block; font-size: 13px; }
@@ -567,6 +569,8 @@ tr:hover td { background: #fafbfc; }
 .kind.expected_spike { color: #a56b00; }
 
 .kind.resolve { color: var(--ok); }
+
+.kind.deploy { color: var(--accent-deep); }
 
 .kind.ingest { color: #2f6fed; }
 

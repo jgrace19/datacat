@@ -127,6 +127,8 @@ export function healthyValue(metric: MetricId, t: number, rand: () => number): n
 export type ModeFlags = {
   anomaly: boolean;
   expected: boolean;
+  /** Scales GMV and AOV. `1` is healthy. Omit it to follow `anomaly`. */
+  priceFactor?: number;
 };
 
 /**
@@ -136,8 +138,9 @@ export type ModeFlags = {
  */
 export function applyMode(metric: MetricId, healthy: number, mode: ModeFlags): number {
   let value = healthy;
-  if (mode.anomaly && (metric === GMV_CENTS || metric === AOV_CENTS)) {
-    value = Math.round(healthy * ANOMALY_PRICE_FACTOR);
+  const factor = mode.priceFactor !== undefined ? mode.priceFactor : mode.anomaly ? ANOMALY_PRICE_FACTOR : 1;
+  if ((metric === GMV_CENTS || metric === AOV_CENTS) && factor !== 1) {
+    value = Math.round(healthy * factor);
   }
   if (mode.expected) {
     if (metric === ORDERS || metric === UNITS || metric === GMV_CENTS) value = Math.round(value * PROMO_LIFT);

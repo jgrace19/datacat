@@ -3,7 +3,8 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatacatApp, HttpError, isRangeKey, type RangeKey } from "./app.ts";
-import { configFromEnv, loadEnvFile } from "./config.ts";
+import { configFromEnv, loadEnvFile, shipConfigFromEnv } from "./config.ts";
+import { ShipWatcher } from "./ship.ts";
 import { EXPECTED_LABEL, PRIMARY_METRIC, EnvNameError } from "./metrics.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -204,6 +205,26 @@ export function createServer(app: DatacatApp): http.Server {
         return;
       }
 
+      if (method === "GET" && pathname === "/api/deploys") {
+        sendJson(res, 200, app.deployStatus());
+        return;
+      }
+
+      if (method === "POST" && pathname === "/api/push-recovery") {
+        const body = asRecord(await readJson(req));
+        const env = body.env === undefined ? undefined : asString(body.env);
+        let pr: number | undefined;
+        if (body.pr !== undefined) {
+          if (typeof body.pr !== "number" || !Number.isInteger(body.pr)) {
+            throw new HttpError(400, "pr must be an integer");
+          }
+          pr = body.pr;
+        }
+        const result = await app.pushRecovery({ env: env || undefined, pr });
+        sendJson(res, 200, result);
+        return;
+      }
+
       const redeliver = pathname.match(/^\/api\/incidents\/([^/]+)\/redeliver$/);
       if (method === "POST" && redeliver) {
         const id = decodeURIComponent(redeliver[1] ?? "");
@@ -255,8 +276,19 @@ export async function main(): Promise<void> {
   loadEnvFile();
   const config = configFromEnv();
   const app = new DatacatApp({ config });
+  const ship = shipConfigFromEnv();
+  const watcher = new ShipWatcher({
+    config: ship,
+    onDeployed: (pr) => {
+      app.beginRecovery({ env: "prod", pr, durationMs: ship.recoveryMs });
+    },
+  });
+  app.setRecoveryListener((notice) => watcher.noteRecovery(notice));
+  app.setDeployStatus(() => watcher.status());
   if (config.historyHours > 0) app.backfill("prod", config.historyHours);
   app.startLoops();
+  if (ship.enabled) watcher.start();
+  else console.log("[datacat] ship watcher off");
   const server = createServer(app);
   const port = await listen(server, config.port, config.host);
   const origin = `http://${config.host === "0.0.0.0" ? "127.0.0.1" : config.host}:${port}`;
@@ -264,6 +296,7 @@ export async function main(): Promise<void> {
   console.log(`[datacat] bot alias ${config.botAlias || "(not set)"}`);
   console.log(`[datacat] snapshot push ${config.metricsPushEnabled ? "on" : "off"} every ${config.metricsPushIntervalMs}ms`);
   const shutdown = () => {
+    watcher.stop();
     app.stopLoops();
     server.close(() => process.exit(0));
   };

@@ -53,6 +53,13 @@ test("anomaly drops GMV and AOV about 32% and a promo lifts volume only", () => 
   assert.equal(promo[AOV_CENTS], healthy[AOV_CENTS]);
   assert.ok(promo[GMV_CENTS] > healthy[GMV_CENTS] * 2);
   assert.ok(promo[LATENCY_P95_MS] > healthy[LATENCY_P95_MS]);
+  const halfway = (1 + ANOMALY_PRICE_FACTOR) / 2;
+  const climbing = applySample(healthy, { anomaly: false, expected: false, priceFactor: halfway });
+  assert.equal(climbing[ORDERS], healthy[ORDERS]);
+  assert.ok(climbing[AOV_CENTS] > anomaly[AOV_CENTS] + 200);
+  assert.ok(climbing[AOV_CENTS] < healthy[AOV_CENTS] - 200);
+  assert.equal(climbing[GMV_CENTS], Math.round(healthy[GMV_CENTS] * halfway));
+
   const expected = { anomaly: false, expected: true };
   assert.equal(monitorStatus(ORDERS, promo[ORDERS], healthy[ORDERS], expected), "warn");
   assert.equal(monitorStatus(LATENCY_P95_MS, promo[LATENCY_P95_MS], healthy[LATENCY_P95_MS], expected), "warn");

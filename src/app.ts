@@ -1,9 +1,12 @@
 import type { Config } from "./config.ts";
 import { DEFAULT_CONFIG, normalizeBotAlias } from "./config.ts";
 import {
+  ANOMALY_PRICE_FACTOR,
+  AOV_CENTS,
   BASELINE_WINDOW_LABEL,
   BASELINE_WINDOW_MS,
   EXPECTED_LABEL,
+  GMV_CENTS,
   METRICS,
   ORDERS,
   PRIMARY_METRIC,
@@ -22,6 +25,7 @@ import {
 } from "./metrics.ts";
 import { SeriesStore, downsample, type Point } from "./store.ts";
 import { signBody } from "./sign.ts";
+import type { DeployStatus, RecoveryNotice } from "./ship.ts";
 
 export class HttpError extends Error {
   constructor(
@@ -56,7 +60,7 @@ export type Incident = {
   };
 };
 
-export type LogKind = "anomaly" | "expected_spike" | "resolve" | "ingest" | "alert" | "push" | "info";
+export type LogKind = "anomaly" | "expected_spike" | "resolve" | "deploy" | "ingest" | "alert" | "push" | "info";
 
 export type LogEvent = {
   id: string;
@@ -92,6 +96,7 @@ type EnvMode = ModeFlags & {
   anomalyAt?: number;
   expectedAt?: number;
   expectedLabel?: string;
+  recovery?: RecoveryRamp;
 };
 
 type IngestPoint = {
@@ -161,6 +166,58 @@ function alertPayload(incident: Incident) {
   };
 }
 
+export type MoneyReading = {
+  value: number;
+  baseline: number;
+  previous: number;
+};
+
+/** Anomaly envelope, plus status and the GMV and AOV readings in cents. */
+export type RecoveryPayload = {
+  incidentId: string;
+  metric: string;
+  env: string;
+  baseline: number;
+  value: number;
+  window: string;
+  status: "recovered";
+  gmv: MoneyReading;
+  aov: MoneyReading;
+};
+
+export function withinBaseline(value: number, baseline: number): boolean {
+  if (!(baseline > 0) || !Number.isFinite(value)) return false;
+  return Math.abs(value - baseline) / baseline <= 0.1;
+}
+
+export type RecoveryDelivery = {
+  status: "delivered" | "failed" | "skipped";
+  statusCode?: number;
+  error?: string;
+  responseBody?: string;
+};
+
+export const RECOVERY_MS = 25_000;
+
+type RecoveryRamp = {
+  from: number;
+  until: number;
+  pr: number;
+  startFactor: number;
+  notified: boolean;
+};
+
+type RecoveryContext = {
+  pr: number;
+  baselineAov: number;
+  baselineGmv: number;
+  previousAov: number;
+  previousGmv: number;
+  incidentId: string;
+  metric: MetricId;
+  window: string;
+};
+
 export type CreateAppOptions = {
   config?: Partial<Config>;
   now?: () => number;
@@ -184,6 +241,11 @@ export class DatacatApp {
   private pushTimer: ReturnType<typeof setInterval> | undefined;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private flushChain: Promise<void> = Promise.resolve();
+  private recoveryChain: Promise<void> = Promise.resolve();
+  private recoveryListener: ((notice: RecoveryNotice) => void) | undefined;
+  private deployStatusFn: (() => DeployStatus) | undefined;
+  private readonly recoveryContext = new Map<string, RecoveryContext>();
+  private readonly anomalySamples = new Map<string, { aov: number; gmv: number }>();
   private botAlias: string;
   private pushEnabled: boolean;
   private pushIntervalMs: number;
@@ -331,6 +393,10 @@ export class DatacatApp {
       delivery: { status: "pending", attempts: 0 },
     };
     this.incidents.push(incident);
+    this.anomalySamples.set(incident.id, {
+      aov: round4(incident.metric === AOV_CENTS ? value : (this.store.latest(env, AOV_CENTS)?.v ?? value)),
+      gmv: round4(incident.metric === GMV_CENTS ? value : (this.store.latest(env, GMV_CENTS)?.v ?? 0)),
+    });
     this.log({
       kind: "anomaly",
       level: "alert",
@@ -383,13 +449,18 @@ export class DatacatApp {
     const now = this.now();
     for (const name of envs) {
       const mode = this.modes.get(name);
-      if (mode?.anomaly || mode?.expected) {
-        const from = Math.min(mode.anomalyAt ?? now, mode.expectedAt ?? now);
+      if (mode?.anomaly || mode?.expected || mode?.recovery) {
+        const marks = [mode.anomalyAt, mode.expectedAt, mode.recovery?.from].filter(
+          (value): value is number => typeof value === "number",
+        );
+        const from = marks.length ? Math.min(...marks) : now;
+        if (mode.recovery) mode.recovery.notified = true;
         mode.anomaly = false;
         mode.expected = false;
         mode.anomalyAt = undefined;
         mode.expectedAt = undefined;
         mode.expectedLabel = undefined;
+        mode.recovery = undefined;
         this.rewriteRange(name, from, now);
         cleared = true;
       }
@@ -409,6 +480,112 @@ export class DatacatApp {
       message: `Resolved ${where}: returned to baseline.`,
     });
     return changed;
+  }
+
+  /**
+   * Close open incidents the way resolve does, leave the anomalous history in place,
+   * and let GMV and AOV climb back over `durationMs`.
+   */
+  beginRecovery(options: { env?: string; pr: number; durationMs?: number } = { pr: 0 }): {
+    env: string;
+    from: number;
+    until: number;
+    resolved: Incident[];
+  } {
+    const env = options.env ?? "prod";
+    assertEnvName(env);
+    const pr = options.pr;
+    if (!Number.isInteger(pr) || pr < 1) throw new HttpError(400, "pr must be a positive integer");
+    const durationMs = options.durationMs ?? RECOVERY_MS;
+    if (!Number.isFinite(durationMs) || durationMs < 1000) throw new HttpError(400, "durationMs must be >= 1000");
+    this.ensureHistory(env);
+    const now = this.now();
+    const mode = this.modeOf(env);
+    const open = this.incidents.filter((incident) => incident.status === "alert" && incident.env === env);
+    const primary = open.find((incident) => incident.metric === AOV_CENTS) ?? open[open.length - 1];
+    const before = mode.anomalyAt ?? now;
+    const baselineAov =
+      primary?.metric === AOV_CENTS ? primary.baseline : this.windowBaseline(env, AOV_CENTS, before);
+    const baselineGmv = this.windowBaseline(env, GMV_CENTS, before);
+    const startFactor = mode.anomaly ? ANOMALY_PRICE_FACTOR : 1;
+    const context: RecoveryContext | undefined = primary
+      ? {
+          pr,
+          baselineAov: round4(baselineAov),
+          baselineGmv: round4(baselineGmv),
+          previousAov: this.anomalySamples.get(primary.id)?.aov ?? round4(this.store.latest(env, AOV_CENTS)?.v ?? primary.value),
+          previousGmv: this.anomalySamples.get(primary.id)?.gmv ?? round4(this.store.latest(env, GMV_CENTS)?.v ?? 0),
+          incidentId: primary.id,
+          metric: primary.metric,
+          window: primary.window,
+        }
+      : undefined;
+    if (context) this.recoveryContext.set(env, context);
+
+    const resolved: Incident[] = [];
+    for (const incident of open) {
+      incident.status = "resolved";
+      incident.resolvedAt = now;
+      resolved.push(incident);
+    }
+    if (mode.recovery) mode.recovery.notified = true;
+    mode.anomaly = false;
+    mode.expected = false;
+    mode.expectedAt = undefined;
+    mode.expectedLabel = undefined;
+    const climbing = startFactor !== 1;
+    mode.recovery = climbing
+      ? { from: now, until: now + durationMs, pr, startFactor, notified: false }
+      : undefined;
+    this.log({
+      kind: "deploy",
+      level: "ok",
+      env,
+      label: `Deploy: PR #${pr}`,
+      t: now,
+      message: climbing
+        ? `Deployed PR #${pr} on ${env}. GMV and AOV are returning to baseline.`
+        : `Deployed PR #${pr} on ${env}.`,
+    });
+    return { env, from: now, until: now + durationMs, resolved };
+  }
+
+  async pushRecovery(options: { env?: string; pr?: number } = {}): Promise<{
+    payload: RecoveryPayload;
+    delivery: RecoveryDelivery;
+  }> {
+    const work = this.enqueueRecovery(this.sendRecovery(options));
+    return work;
+  }
+
+  async whenIdle(): Promise<void> {
+    await this.recoveryChain;
+    await this.flushChain;
+  }
+
+  setRecoveryListener(listener: (notice: RecoveryNotice) => void): void {
+    this.recoveryListener = listener;
+  }
+
+  setDeployStatus(fn: () => DeployStatus): void {
+    this.deployStatusFn = fn;
+  }
+
+  deployStatus(): DeployStatus {
+    if (this.deployStatusFn) return this.deployStatusFn();
+    return {
+      enabled: false,
+      intervalMs: 5_000,
+      repo: "jgrace19/marketplace",
+      base: "demo/base",
+      label: "ship",
+      marketplaceDir: "",
+      backendPort: 8010,
+      lastPollAt: null,
+      lastError: null,
+      handled: [],
+      deploys: [],
+    };
   }
 
   redeliver(id: string): Incident {
@@ -503,7 +680,10 @@ export class DatacatApp {
           event.env === env &&
           event.t >= from &&
           event.t <= to &&
-          (event.kind === "anomaly" || event.kind === "expected_spike" || event.kind === "resolve"),
+          (event.kind === "anomaly" ||
+            event.kind === "expected_spike" ||
+            event.kind === "resolve" ||
+            event.kind === "deploy"),
       )
       .map((event) => ({ t: event.t, kind: event.kind, label: event.label ?? event.kind }));
     return {
@@ -521,6 +701,9 @@ export class DatacatApp {
         expected: mode.expected,
         expectedAt: mode.expectedAt ?? null,
         expectedLabel: mode.expectedLabel ?? null,
+        recovery: mode.recovery
+          ? { pr: mode.recovery.pr, from: mode.recovery.from, until: mode.recovery.until }
+          : null,
       },
       generator: {
         running: this.loopsStarted,
@@ -695,6 +878,125 @@ export class DatacatApp {
     }
   }
 
+  private enqueueRecovery<T>(work: Promise<T>): Promise<T> {
+    const run = this.recoveryChain.then(() => work);
+    this.recoveryChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async sendRecovery(options: { env?: string; pr?: number }): Promise<{
+    payload: RecoveryPayload;
+    delivery: RecoveryDelivery;
+  }> {
+    const env = options.env ?? "prod";
+    assertEnvName(env);
+    if (env !== "prod") throw new HttpError(400, "recovery env must be prod");
+    const context = this.recoveryContext.get(env);
+    const incident =
+      (context ? this.incidents.find((item) => item.id === context.incidentId) : undefined) ??
+      this.incidents.find((item) => item.status === "alert" && item.env === env) ??
+      [...this.incidents].reverse().find((item) => item.env === env && this.anomalySamples.has(item.id));
+    if (!incident) throw new HttpError(400, "no anomaly incident");
+    const sample = this.anomalySamples.get(incident.id);
+    const previousAov = context?.previousAov ?? sample?.aov;
+    const previousGmv = context?.previousGmv ?? sample?.gmv;
+    if (previousAov === undefined || previousGmv === undefined) throw new HttpError(400, "no anomaly incident");
+    const aov = round4(this.store.latest(env, AOV_CENTS)?.v ?? 0);
+    const gmv = round4(this.store.latest(env, GMV_CENTS)?.v ?? 0);
+    const mode = this.modeOf(env);
+    const before = mode.anomalyAt ?? mode.recovery?.from ?? incident.openedAt;
+    const baselineAov = round4(
+      context?.baselineAov ??
+        (incident.metric === AOV_CENTS ? incident.baseline : this.windowBaseline(env, AOV_CENTS, before)),
+    );
+    const baselineGmv = round4(context?.baselineGmv ?? this.windowBaseline(env, GMV_CENTS, before));
+    const metric = context?.metric ?? incident.metric;
+    const payload: RecoveryPayload = {
+      incidentId: incident.id,
+      metric,
+      env,
+      baseline: metric === GMV_CENTS ? baselineGmv : baselineAov,
+      value: metric === GMV_CENTS ? gmv : aov,
+      window: context?.window ?? incident.window,
+      status: "recovered",
+      gmv: { value: gmv, baseline: baselineGmv, previous: round4(previousGmv) },
+      aov: { value: aov, baseline: baselineAov, previous: round4(previousAov) },
+    };
+    if (
+      !withinBaseline(payload.value, payload.baseline) ||
+      !withinBaseline(payload.gmv.value, payload.gmv.baseline) ||
+      !withinBaseline(payload.aov.value, payload.aov.baseline)
+    ) {
+      throw new HttpError(409, "metrics are not within 10% of baseline");
+    }
+    const delivery = await this.postRecovery(payload);
+    const pr = options.pr ?? context?.pr;
+    if (pr !== undefined) {
+      this.recoveryListener?.({
+        pr,
+        status: delivery.status,
+        statusCode: delivery.statusCode,
+        error: delivery.error,
+      });
+    }
+    return { payload, delivery };
+  }
+
+  private async postRecovery(payload: RecoveryPayload): Promise<RecoveryDelivery> {
+    const label = payload.incidentId;
+    if (!this.botAlias) {
+      const delivery: RecoveryDelivery = { status: "skipped", error: "BOT_ALIAS is not set" };
+      this.logRecovery(payload, delivery);
+      console.log(`[datacat] recovery ${label} skipped: BOT_ALIAS is not set`);
+      return delivery;
+    }
+    const body = JSON.stringify(payload);
+    try {
+      const response = await this.fetchImpl(joinUrl(this.botAlias, ALERT_PATH), {
+        method: "POST",
+        headers: this.authHeaders(body, `incident:${payload.incidentId}`),
+        body,
+        signal: AbortSignal.timeout(5000),
+      });
+      const text = (await response.text()).slice(0, 2000);
+      if (!response.ok) {
+        const delivery: RecoveryDelivery = {
+          status: "failed",
+          statusCode: response.status,
+          responseBody: text,
+          error: `HTTP ${response.status}`,
+        };
+        this.logRecovery(payload, delivery);
+        console.log(`[datacat] recovery ${label} failed: HTTP ${response.status}`);
+        return delivery;
+      }
+      const delivery: RecoveryDelivery = { status: "delivered", statusCode: response.status, responseBody: text };
+      this.logRecovery(payload, delivery);
+      console.log(`[datacat] recovery ${label} delivered (HTTP ${response.status})`);
+      return delivery;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const delivery: RecoveryDelivery = { status: "failed", error: message };
+      this.logRecovery(payload, delivery);
+      console.log(`[datacat] recovery ${label} failed: ${message}`);
+      return delivery;
+    }
+  }
+
+  private logRecovery(payload: RecoveryPayload, delivery: RecoveryDelivery): void {
+    const detail = delivery.error ? `: ${delivery.error}` : delivery.statusCode ? ` (HTTP ${delivery.statusCode})` : "";
+    this.log({
+      kind: "info",
+      level: delivery.status === "delivered" ? "ok" : "warn",
+      env: payload.env,
+      label: "recovered",
+      message: `Recovery for ${payload.env} ${delivery.status}${detail}. GMV ${formatMetric(GMV_CENTS, payload.gmv.value)} (baseline ${formatMetric(GMV_CENTS, payload.gmv.baseline)}), AOV ${formatMetric(AOV_CENTS, payload.aov.value)} (baseline ${formatMetric(AOV_CENTS, payload.aov.baseline)}).`,
+    });
+  }
+
   private authHeaders(body: string, sessionKey: string): Record<string, string> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -767,9 +1069,25 @@ export class DatacatApp {
     this.backfill(env, hours);
   }
 
+  private priceFactor(mode: EnvMode, t: number): number | undefined {
+    const recovery = mode.recovery;
+    if (!recovery) return undefined;
+    if (t <= recovery.from) return recovery.startFactor;
+    if (t >= recovery.until) return 1;
+    const progress = (t - recovery.from) / (recovery.until - recovery.from);
+    return recovery.startFactor + (1 - recovery.startFactor) * progress;
+  }
+
   private basket(env: string, t: number, transform: boolean) {
     const healthy = sampleHealthy(t, randAt(env, "basket", t));
-    return transform ? applySample(healthy, this.modeOf(env)) : healthy;
+    if (!transform) return healthy;
+    const mode = this.modeOf(env);
+    const flags: ModeFlags = {
+      anomaly: mode.anomaly,
+      expected: mode.expected,
+      priceFactor: this.priceFactor(mode, t),
+    };
+    return applySample(healthy, flags);
   }
 
   private writeSamples(env: string, t: number, transform: boolean): void {
@@ -779,6 +1097,37 @@ export class DatacatApp {
     }
     const previous = this.lastT.get(env) ?? 0;
     if (t > previous) this.lastT.set(env, t);
+    if (transform) this.finishRecoveryIfDue(env, t);
+  }
+
+  private finishRecoveryIfDue(env: string, t: number): void {
+    const mode = this.modes.get(env);
+    const recovery = mode?.recovery;
+    if (!recovery) return;
+    const settled = t >= recovery.until;
+    if (recovery.notified) {
+      if (settled) mode.recovery = undefined;
+      return;
+    }
+    if (!this.readingsWithinBand(env)) return;
+    recovery.notified = true;
+    if (settled) mode.recovery = undefined;
+    void this.pushRecovery({ env, pr: recovery.pr });
+  }
+
+  private readingsWithinBand(env: string): boolean {
+    const context = this.recoveryContext.get(env);
+    if (!context) return false;
+    const aov = this.store.latest(env, AOV_CENTS)?.v;
+    const gmv = this.store.latest(env, GMV_CENTS)?.v;
+    if (aov === undefined || gmv === undefined) return false;
+    return withinBaseline(aov, context.baselineAov) && withinBaseline(gmv, context.baselineGmv);
+  }
+
+  private windowBaseline(env: string, metric: MetricId, before: number): number {
+    const points = this.store.query(env, metric, before - BASELINE_WINDOW_MS, before - 1);
+    if (points.length === 0) return healthyValue(metric, before, () => 0.5);
+    return average(points.map((point) => point.v));
   }
 
   /** Recompute stored samples in [start, now] from the deterministic basket and the current mode. */

@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "test": "tsx --test test/config.test.ts test/store.test.ts test/metrics.test.ts test/app.test.ts test/api.test.ts test/preview-runner.test.ts",
+    "ship-watcher": "tsx src/ship-watcher.ts",
+    "test": "tsx --test test/config.test.ts test/store.test.ts test/metrics.test.ts test/app.test.ts test/api.test.ts test/preview-runner.test.ts test/deploy.test.ts test/ship.test.ts",
     "typecheck": "tsc --noEmit",
     "preview": "tsx scripts/preview-runner.ts"
   },
